@@ -1,30 +1,121 @@
+"""KalmanNet-inspired nonlinear state estimator for sensor fusion tasks.
+
+项目背景 (Project Background):
+    本模块实现 KalmanNet 风格的神经网络，用于非线性状态估计与滤波，结合
+    Recurrent NN 与 Kalman Gain 学习，解决传统滤波器对模型敏感的问题。
+
+输入输出概览 (Input/Output Overview):
+    - 训练阶段: 接收观测序列 y ∈ ℝ^[batch_size, T, n_obs]，输出状态估计
+      x_hat ∈ ℝ^[batch_size, T, n_states] 并学习动态增益。
+    - 推理阶段: `forward` 接收单步观测 y_t ∈ ℝ^[batch_size, n_obs]，返回后验
+      状态均值 x_post ∈ ℝ^[batch_size, n_states]。
+"""
+
 # Adpoted from: https://github.com/KalmanNet/Unsupervised_EUSIPCO_22
+import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as func
 import gc
 import sys
+
+
+def count_params(model: nn.Module):
+    """统计模型参数数量 / Count total and trainable parameters.
+
+    Args:
+        model (nn.Module): 待评估的 PyTorch 模型实例，需实现 `.parameters()` 迭代器。
+
+    Returns:
+        tuple[int, int]:
+            - total_params: 模型全部参数个数。
+            - trainable_params: 需要梯度更新的参数个数。
+
+    Tensor Dimensions:
+        - 参数向量视作一维数组，总元素个数以 `numel()` 计数。
+
+    Math Notes:
+        total_params = Σ param.numel()
+        trainable_params = Σ param.numel() for param.requires_grad is True
+    """
+
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 # +++++++++++Colab_Start+++++++
 # from utils.utils import count_params
 # +++++++++++Colab_End+++++++
 
 
 class KalmanNetNN(nn.Module):
+    """KalmanNet 神经网络骨干 / Neural backbone for adaptive Kalman gain.
 
-    def __init__(self, n_states, n_obs, n_layers=1, device='cpu'):
+    Args:
+        n_states (int): 状态维度 m；即系统隐藏变量的维度。
+        n_obs (int): 观测维度 n；对应传感器输出长度。
+        n_layers (int): GRU 隐层层数，用于建模时间上下文。
+        device (str): 计算设备标识，如 'cpu' 或 'cuda:0'。
+        rnn_type (str): 日志和模型命名用的标识，保持与其他模块一致。
+
+    Returns:
+        KalmanNetNN: 实例化后的模型，可调用 `Build`、`forward` 等方法完成滤波。
+
+    Tensor Dimensions:
+        - 输入观测 y_t: [batch_size, n_obs]
+        - 状态输出 x_t: [batch_size, n_states]
+        - GRU 隐状态 h_t: [n_layers, batch_size, hidden_dim]
+
+    Math Notes:
+        模型通过前馈层与 GRU 映射学习 Kalman 增益 K_t，使得
+        x_post = x_prior + K_t @ innovation，其中 innovation = y_t - y_hat。
+    """
+
+    def __init__(self, n_states, n_obs, n_layers=1, device='cpu', rnn_type='gru'):
+        """初始化 KalmanNet 架构 / Build layer dimensions and attributes.
+
+        Args:
+            n_states (int): 状态维度 m。
+            n_obs (int): 观测维度 n。
+            n_layers (int): GRU 堆叠层数，默认 1。
+            device (str): 计算设备字符串，例如 'cpu' 或 'cuda:0'。
+            rnn_type (str): RNN 结构标签，用于日志命名。
+
+        Returns:
+            None: 直接在实例上设置层与形状信息。
+
+        Tensor Dimensions:
+            - d_in = n_states + n_obs (Kalman Gain 输入特征长度)
+            - hidden_dim = (n_states^2 + n_obs^2) * 10 (GRU 隐状态)
+            - d_out = n_obs * n_states (Kalman Gain 输出展平)
+
+        Math Notes:
+            h1_knet = (n_states + n_obs) * 80  # 扩大表示容量
+            h2_knet = (n_states + n_obs) * 10
+        """
+
+        # ==================================================================
+        # STEP 01: 基础超参数与设备设置 (Hyper-parameter setup)
+        # ------------------------------------------------------------------
         super(KalmanNetNN, self).__init__()
 
         self.n_states = n_states # Setting the number of states of the KalmanNet model
         self.n_obs = n_obs # Setting the number of observations of the KalmanNet model
         self.device = device # Setting the device
+        self.rnn_type = rnn_type  # For logging/checkpoint naming alignment
 
+        # ==================================================================
+        # STEP 02: 计算网络层尺寸 (Derive layer dimensions)
+        # ------------------------------------------------------------------
         # Setting the no. of neurons in hidden layers
         self.h1_knet = (self.n_states +  self.n_obs) * (10) * 8
         self.h2_knet = (self.n_states + self.n_obs) * (10) * 1
         self.d_in = self.n_states + self.n_obs # Input vector dimension for KNet
         self.d_out = int(self.n_obs * self.n_states) # Output vector dimension for KNet
 
+        # ==================================================================
+        # STEP 03: GRU 维度配置 (GRU configuration)
+        # ------------------------------------------------------------------
         # Setting the GRU specific nets
         self.input_dim = self.h1_knet # Input Dimension for the RNN
         self.hidden_dim = (self.n_states ** 2 + self.n_obs **2) * 10 # Hidden Dimension of the RNN
@@ -35,9 +126,33 @@ class KalmanNetNN(nn.Module):
 
         # batch_first = False
         # dropout = 0.1 ;
+        # STEP 04: 预留返回 (No return, stateful init)
+        # ------------------------------------------------------------------
         return None
 
     def Build(self, f, h):
+        """构建 KalmanNet 所需的层与系统函数 / Build neural modules.
+
+        Args:
+            f (Callable): 状态转移函数，输入 x ∈ ℝ^[n_states, 1]，输出同形状。
+            h (Callable): 观测映射函数，输入 x_prior，同样输出 ℝ^[n_obs, 1]。
+
+        Returns:
+            None: 内部保存函数与神经网络层实例。
+
+        Tensor Dimensions:
+            - f(x): [n_states, 1]
+            - h(x): [n_obs, 1]
+            - KGain 输入向量: [batch_size, d_in]
+
+        Math Notes:
+            innovation = y_t - y_hat
+            gain_vector = GRU(ReLU(Linear(innovation, delta_x)))
+        """
+
+        # ==================================================================
+        # STEP 01: 包装系统函数为张量输出 (Wrap system dynamics)
+        # ------------------------------------------------------------------
 
         # Initialize the dynamics of the underlying ssm (equivalent of InitSystemDynamics(self, F, H) in original code)
         # self.f_k = f
@@ -52,6 +167,9 @@ class KalmanNetNN(nn.Module):
         self.f_k = lambda x: _to_tensor(f(x))
         self.h_k = lambda x: _to_tensor(h(x))
 
+        # ==================================================================
+        # STEP 02: 初始化 Kalman Gain 网络层 (Build Kalman Gain network)
+        # ------------------------------------------------------------------
         ##############################################
         # Initializing the Kalman Gain network
         # This network is: FC + RNN (e.g. GRU) + FC
@@ -98,6 +216,24 @@ class KalmanNetNN(nn.Module):
     ### Initialize Sequence ###
     ###########################
     def InitSequence(self, M1_0):
+        """初始化滤波循环中的先验 / Initialize prior state sequence.
+
+        Args:
+            M1_0 (torch.Tensor): 初始状态均值，形状 [n_states, 1]。
+
+        Returns:
+            None: 内部缓存先验与后验均值副本。
+
+        Tensor Dimensions:
+            - m1x_prior, m1x_posterior: [n_states, batch_size]
+
+        Math Notes:
+            x_prior_{0|−1} = repeat(M1_0, batch_size)
+        """
+
+        # ==================================================================
+        # STEP 01: 适配批量维度 (Broadcast initial mean)
+        # ------------------------------------------------------------------
 
         # Adjust for batch size
         M1_0 = torch.cat(self.batch_size*[M1_0],axis = 1).reshape(self.n_states, self.batch_size)
@@ -109,6 +245,24 @@ class KalmanNetNN(nn.Module):
     ### Set Batch Size and initialize hidden state of GRU ###
     #########################################################
     def SetBatch(self,batch_size):
+        """设置批量大小并重置 GRU 隐状态 / Configure batch and hidden state.
+
+        Args:
+            batch_size (int): 当前 mini-batch 样本数。
+
+        Returns:
+            None: 更新内部 `batch_size` 与 `hn`。
+
+        Tensor Dimensions:
+            - hn: [n_layers, batch_size, hidden_dim]
+
+        Math Notes:
+            hn = N(0, I) 初始化以提供随机起点，避免死区。
+        """
+
+        # ==================================================================
+        # STEP 01: 更新 batch_size 并重建随机隐状态 (Reset hidden state)
+        # ------------------------------------------------------------------
         self.batch_size = batch_size
         self.hn = torch.randn(self.seq_len_hidden,self.batch_size,self.hidden_dim,requires_grad=False).to(self.device)
 
@@ -116,6 +270,25 @@ class KalmanNetNN(nn.Module):
     ### Compute Priors ###
     ######################
     def step_prior(self):
+        """单步先验预测 / Perform prior prediction for state and observation.
+
+        Returns:
+            None: 更新 `state_process_prior_0`, `obs_process_0`, `m1x_prior`, `m1y`。
+
+        Tensor Dimensions:
+            - state_process_prior_0: [n_states, batch_size]
+            - obs_process_0: [n_obs, batch_size]
+            - m1x_prior: [n_states, batch_size]
+            - m1y: [n_obs, batch_size]
+
+        Math Notes:
+            x_prior = f(x_post_prev)
+            y_hat = h(x_prior)
+        """
+
+        # ==================================================================
+        # STEP 01: 生成状态先验 (State prior propagation)
+        # ------------------------------------------------------------------
 
         # Compute the 1-st moment of x based on model knowledge and without process noise
         self.state_process_prior_0 = torch.zeros_like(self.state_process_posterior_0).type(torch.FloatTensor).to(self.device)
@@ -124,12 +297,18 @@ class KalmanNetNN(nn.Module):
             self.state_process_prior_0[:, i] = self.f_k(self.state_process_posterior_0[:,i].reshape((-1,1))).view(-1,)
         #self.state_process_prior_0 = self.f_k(self.state_process_posterior_0) # torch.matmul(self.F,self.state_process_posterior_0)
 
+        # ==================================================================
+        # STEP 02: 预测观测 (Observation prediction)
+        # ------------------------------------------------------------------
         # Compute the 1-st moment of y based on model knowledge and without noise
         self.obs_process_0 = torch.zeros_like(self.state_process_prior_0).type(torch.FloatTensor).to(self.device)
         for i in range(self.state_process_posterior_0.shape[1]):
             self.obs_process_0[:, i] = self.h_k(self.state_process_prior_0[:,i].reshape((-1,1))).view(-1,)
         #self.obs_process_0 = self.h_k(self.state_process_posterior_0) # torch.matmul(self.H, self.state_process_prior_0)
 
+        # ==================================================================
+        # STEP 03: 更新状态与观测的均值 (Update means for recursion)
+        # ------------------------------------------------------------------
         # Predict the 1-st moment of x
         self.m1x_prev_prior = self.m1x_prior
         self.m1x_prior = torch.zeros_like(self.m1x_posterior).type(torch.FloatTensor).to(self.device)
@@ -145,16 +324,46 @@ class KalmanNetNN(nn.Module):
     ### Kalman Net Step ###
     #######################
     def KNet_step(self, y):
+        """执行 KalmanNet 单步更新 / Perform one KalmanNet update.
+
+        Args:
+            y (torch.Tensor): 当前观测，形状 [n_obs, batch_size]。
+
+        Returns:
+            torch.Tensor: 后验状态均值 `m1x_posterior`，形状 [batch_size, n_states] 展平。
+
+        Tensor Dimensions:
+            - y: [n_obs, batch_size]
+            - KGain: [batch_size, n_states, n_obs]
+            - INOV: [n_states, batch_size]
+
+        Math Notes:
+            dy = y - y_hat
+            x_post = x_prior + K_t @ dy
+        """
+
+        # ==================================================================
+        # STEP 01: 预测先验 (Predict prior)
+        # ------------------------------------------------------------------
 
         self.step_prior() # Compute Priors
 
+        # ==================================================================
+        # STEP 02: 估计 Kalman 增益 (Estimate Kalman gain)
+        # ------------------------------------------------------------------
         self.step_KGain_est(y)  # Compute Kalman Gain
 
+        # ==================================================================
+        # STEP 03: 计算创新项并归一化 (Compute innovation)
+        # ------------------------------------------------------------------
         dy = y - self.m1y # Compute the innovation
 
         #NOTE: My own change!!
         dy = func.normalize(dy, p=2, dim=0, eps=1e-12, out=None) # Extra normalization
 
+        # ==================================================================
+        # STEP 04: 更新后验 (Posterior update)
+        # ------------------------------------------------------------------
         # Compute the 1-st posterior moment
         # Initialize array of Innovations
         INOV = torch.empty((self.n_states, self.batch_size),device= self.device)
@@ -176,6 +385,29 @@ class KalmanNetNN(nn.Module):
     ### Kalman Gain Estimation ###
     ##############################
     def step_KGain_est(self, y):
+        """估计 Kalman 增益向量 / Estimate Kalman gain via neural network.
+
+        Args:
+            y (torch.Tensor): 当前观测 [n_obs, batch_size]。
+
+        Returns:
+            None: 更新 `KGain` 属性。
+
+        Tensor Dimensions:
+            - dm1x_norm: [n_states]
+            - dm1y_norm: [n_obs]
+            - KGainNet_in: [d_in]
+            - KGain: [batch_size, n_states, n_obs]
+
+        Math Notes:
+            dm1x = x_post_prev - x_prior_prev
+            dm1y = y - y_hat
+            KGain = reshape(NeuralNet([dm1y_norm, dm1x_norm]))
+        """
+
+        # ==================================================================
+        # STEP 01: 构建状态差异特征 (State residual features)
+        # ------------------------------------------------------------------
 
         # Reshape and Normalize the difference in X prior
         # dm1x = self.m1x_prior - self.state_process_prior_0
@@ -184,11 +416,17 @@ class KalmanNetNN(nn.Module):
         dm1x_reshape = torch.squeeze(dm1x)
         dm1x_norm = func.normalize(dm1x_reshape, p=2, dim=0, eps=1e-12, out=None)
 
+        # ==================================================================
+        # STEP 02: 构建观测差异特征 (Observation residual)
+        # ------------------------------------------------------------------
         # Normalize y
         # (this is equivalent to Innovation at time t: \delta y_t = y_t - \hat{y}_{t \vert t-1} (self.n_obs, 1))
         dm1y = y - torch.squeeze(self.m1y) #y.squeeze() - torch.squeeze(self.m1y)
         dm1y_norm = func.normalize(dm1y, p=2, dim=0, eps=1e-12, out=None)
 
+        # ==================================================================
+        # STEP 03: 拼接输入并运行网络 (Run gain network)
+        # ------------------------------------------------------------------
         # KGain Net Input
         KGainNet_in = torch.cat([dm1y_norm, dm1x_norm], dim=0)
 
@@ -204,6 +442,26 @@ class KalmanNetNN(nn.Module):
     ### Kalman Gain Step ###
     ########################
     def KGain_step(self, KGainNet_in):
+        """前向传播 Kalman 增益网络 / Forward pass through gain estimator.
+
+        Args:
+            KGainNet_in (torch.Tensor): 拼接后的特征，形状 [batch_size, d_in]。
+
+        Returns:
+            torch.Tensor: 展平的 Kalman 增益向量，形状 [batch_size, d_out]。
+
+        Tensor Dimensions:
+            - L1_out: [batch_size, h1_knet]
+            - GRU_out: [batch_size, seq_len_input, hidden_dim]
+            - L3_out: [batch_size, d_out]
+
+        Math Notes:
+            gain_vec = Linear2(ReLU2(GRU(ReLU1(Linear1(KGainNet_in)))))
+        """
+
+        # ==================================================================
+        # STEP 01: 前馈输入层 (Feed-forward input layer)
+        # ------------------------------------------------------------------
 
         ###################
         ### Input Layer ###
@@ -212,6 +470,9 @@ class KalmanNetNN(nn.Module):
         La1_out = self.KG_relu1(L1_out)
         assert torch.isnan(La1_out).any() == False, "NaNs in La1_out computation"
 
+        # ==================================================================
+        # STEP 02: GRU 序列建模 (Temporal modeling)
+        # ------------------------------------------------------------------
         ###########
         ### GRU ###
         ###########
@@ -222,6 +483,9 @@ class KalmanNetNN(nn.Module):
         GRU_out_reshape = torch.reshape(GRU_out, (self.batch_size, self.hidden_dim))
         assert torch.isnan(GRU_out_reshape).any() == False, "NaNs in GRU_output computation"
 
+        # ==================================================================
+        # STEP 03: 隐层与输出层 (Hidden and output layers)
+        # ------------------------------------------------------------------
         ####################
         ### Hidden Layer ###
         ####################
@@ -242,6 +506,25 @@ class KalmanNetNN(nn.Module):
     ### Forward ###
     ###############
     def forward(self, yt):
+        """模型前向接口 / Forward entry point matching nn.Module API.
+
+        Args:
+            yt (torch.Tensor): 当前时间步观测，形状 [batch_size, n_obs]。
+
+        Returns:
+            torch.Tensor: 后验状态估计，形状 [batch_size, n_states] 展平。
+
+        Tensor Dimensions:
+            - yt.T: [n_obs, batch_size]
+            - 返回值 squeeze 后 [n_states]
+
+        Math Notes:
+            通过 `KNet_step` 完成完整的预测-更新循环。
+        """
+
+        # ==================================================================
+        # STEP 01: 转置观测并执行单步更新 (Process observation)
+        # ------------------------------------------------------------------
         yt = yt.T.to(self.device,non_blocking = True)
         return self.KNet_step(yt)
 
@@ -249,11 +532,46 @@ class KalmanNetNN(nn.Module):
     ### Init Hidden State ###
     #########################
     def init_hidden(self):
+        """初始化 GRU 隐状态张量 / Reset hidden state buffer.
+
+        Returns:
+            None: 更新 `hn` 属性。
+
+        Tensor Dimensions:
+            - hidden: [n_layers, batch_size, hidden_dim]
+
+        Math Notes:
+            使用零初始化，保持与标准 GRU 一致，避免引入额外偏差。
+        """
+
+        # ==================================================================
+        # STEP 01: 基于当前参数形状生成零张量 (Zero initialization)
+        # ------------------------------------------------------------------
         weight = next(self.parameters()).data
         hidden = weight.new(self.n_layers, self.batch_size, self.hidden_dim).zero_()
         self.hn = hidden.data
 
     def compute_predictions(self, y_test_batch):
+        """批量推理生成状态估计 / Compute predictions over a sequence.
+
+        Args:
+            y_test_batch (torch.Tensor): 测试观测，形状 [N_T, T, n_obs]。
+
+        Returns:
+            torch.Tensor: 状态估计时间序列，形状 [N_T, n_states, T]。
+
+        Tensor Dimensions:
+            - 输入 y_test_batch: [batch, time, obs]
+            - x_out_test: [batch, n_states, time]
+            - y_out_test: [batch, n_obs, time]
+
+        Math Notes:
+            对每个时间步调用 forward，实现循环滤波。
+        """
+
+        # ==================================================================
+        # STEP 01: 数据整理与缓存初始化 (Prepare tensors)
+        # ------------------------------------------------------------------
 
         test_input = y_test_batch.to(self.device)
         N_T, Ty, dy = test_input.shape
@@ -266,15 +584,56 @@ class KalmanNetNN(nn.Module):
 
         test_input = torch.transpose(test_input, 1, 2).type(torch.FloatTensor)
 
+        # ==================================================================
+        # STEP 02: 循环执行 KalmanNet 更新 (Iterative inference)
+        # ------------------------------------------------------------------
         for t in range(0, Ty):
             x_out_test[:,:, t] = self.forward(test_input[:,:, t]).T
             y_out_test[:,:, t] = self.m1y.T
 
+        # ==================================================================
+        # STEP 03: 返回状态轨迹 (Return estimates)
+        # ------------------------------------------------------------------
         return x_out_test
 
 def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
                     logfile_path, modelfile_path, save_chkpoints, device='cpu',
                     tr_verbose=False, unsupervised=True):
+    """训练 KalmanNet 模型 / Train KalmanNet neural estimator.
+
+    Args:
+        model (KalmanNetNN): 待训练的 KalmanNet 模型实例。
+        options (dict): 训练超参数字典，需包含 `lr`, `weight_decay` 等键。
+        train_loader (DataLoader): 训练数据迭代器，输出 (y_batch, x_batch)。
+        val_loader (DataLoader): 验证数据迭代器，格式同训练。
+        nepochs (int): 训练迭代轮数。
+        logfile_path (str or None): 日志文件路径；None 时使用默认位置。
+        modelfile_path (str or None): 模型保存目录；None 时默认 `./models/`。
+        save_chkpoints (str or None): 'all'/'some'/None 定义保存策略。
+        device (str): 计算设备。
+        tr_verbose (bool): 是否输出详细训练日志。
+        unsupervised (bool): True 时使用观测重建损失。
+
+    Returns:
+        tuple[np.ndarray, np.ndarray, KalmanNetNN]:
+            - MSE_train_dB_epoch_obs: 训练集观测损失 (dB) 数组。
+            - MSE_cv_dB_epoch_obs: 验证集观测损失 (dB) 数组。
+            - model: 训练后的模型实例。
+
+    Tensor Dimensions:
+        - y_batch: [batch, T, n_obs]
+        - train_target: [batch, T, n_states]
+        - x_out_training: [batch, n_states, T]
+
+    Math Notes:
+        loss_state = MSE(x_hat, x_gt)
+        loss_obs = MSE(y_hat, y)
+        优化目标根据 `unsupervised` 选择上述之一。
+    """
+
+    # ==========================================================================
+    # STEP 01: 模型推送与日志初始化 (Model to device & logging setup)
+    # --------------------------------------------------------------------------
 
     # Set pipeline parameters: setting ssModel and model
     # 1. Set the KalmanNet model and push to its device
@@ -308,9 +667,7 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
     else:
         model_filepath = modelfile_path
 
-    #if save_chkpoints == True:
     if save_chkpoints == "all" or save_chkpoints == "some":
-        # No grid search
         if logfile_path is None:
             training_logfile = "./log/knet_{}.log".format(model.rnn_type)
         else:
@@ -332,6 +689,9 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
     print("No. of trainable parameters: {}\n".format(total_num_trainable_params), file=orig_stdout)
     print("No. of trainable parameters: {}\n".format(total_num_trainable_params))
 
+    # ==========================================================================
+    # STEP 02: 逐 epoch 训练与验证 (Epoch loop)
+    # --------------------------------------------------------------------------
     for ti in range(0, nepochs):
 
         #################################
@@ -340,6 +700,9 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
         # Cross Validation Mode
         model.eval()
 
+        # ------------------------------------------------------------------
+        # step 2a) 验证集前向推理与损失统计
+        # ------------------------------------------------------------------
         with torch.no_grad():
           # Load obserations and targets from CV data
           y_cv, cv_target = next(iter(val_loader))
@@ -377,7 +740,7 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
             MSE_cv_dB_opt = relevant_loss
             MSE_cv_idx_opt = ti
             print("Saving model ...")
-            torch.save(model.state_dict(), modelfile_path + "/" + "knet_ckpt_epoch_best.pt")
+            torch.save(model.state_dict(), os.path.join(model_filepath, "knet_ckpt_epoch_best.pt"))
 
         ###############################
         ### Training Sequence Batch ###
@@ -391,6 +754,9 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
 
         Batch_Optimizing_LOSS_sum = 0
 
+        # ------------------------------------------------------------------
+        # step 2b) 取训练 batch 并执行前向-反向
+        # ------------------------------------------------------------------
         # Load random batch sized data, creating new iter ensures the data is shuffled
         y_training, train_target = next(iter(train_loader))
         N_E, Ty, dy = y_training.shape
@@ -460,6 +826,9 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
         # parameters
         optimizer.step()
 
+        # ------------------------------------------------------------------
+        # step 2c) 记录训练与验证指标 (Logging metrics)
+        # ------------------------------------------------------------------
         ########################
         ### Training Summary ###
         ########################
@@ -498,6 +867,34 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
     return MSE_train_dB_epoch_obs, MSE_cv_dB_epoch_obs, model
 
 def test_KalmanNetNN(model_test, test_loader, options, device, model_file=None, test_logfile_path = None):
+    """评估 KalmanNet 模型性能 / Evaluate trained KalmanNet.
+
+    Args:
+        model_test (KalmanNetNN): 已训练模型实例。
+        test_loader (DataLoader): 测试数据迭代器。
+        options (dict): 含 `N_T` 等评估超参数。
+        device (str): 计算设备。
+        model_file (str or None): 权重文件路径。
+        test_logfile_path (str or None): 测试日志输出路径。
+
+    Returns:
+        tuple[float, float, torch.Tensor]:
+            - MSE_test_dB_avg: 状态估计 MSE (dB)。
+            - MSE_test_dB_avg_obs: 观测重建 MSE (dB)。
+            - x_out_test: 状态估计时间序列 [N_T, n_states, T]。
+
+    Tensor Dimensions:
+        - test_input: [batch, T, n_obs]
+        - x_out_test: [batch, n_states, T]
+
+    Math Notes:
+        loss_state = mean((x_hat - x)^2)
+        loss_obs = mean((y_hat - y)^2)
+    """
+
+    # ==========================================================================
+    # STEP 01: 加载参数并准备张量 (Load weights & tensors)
+    # --------------------------------------------------------------------------
 
     with torch.no_grad():
 
@@ -535,6 +932,9 @@ def test_KalmanNetNN(model_test, test_loader, options, device, model_file=None, 
         x_out_test = torch.empty(N_T, model_test.n_states, Ty, device=device)
         y_out_test = torch.empty(N_T, model_test.n_obs, Ty, device=device)
 
+        # ==========================================================================
+        # STEP 02: 序列推理与损失累计 (Iterate over timeline)
+        # --------------------------------------------------------------------------
         for t in range(0, Ty):
             x_out_test[:,:, t] = model_test(test_input[:,:, t]).T
             y_out_test[:,:, t] = model_test.m1y.T
@@ -557,6 +957,9 @@ def test_KalmanNetNN(model_test, test_loader, options, device, model_file=None, 
         MSE_test_linear_avg_obs = torch.mean(MSE_test_linear_arr_obs)
         MSE_test_dB_avg_obs = 10 * torch.log10(MSE_test_linear_avg_obs).item()
 
+        # ==========================================================================
+        # STEP 03: 写入日志并返回 (Log and return)
+        # --------------------------------------------------------------------------
         with open(test_log, "a") as logfile_test:
             logfile_test.write('Test MSE loss: {:.3f}, Test MSE loss obs: {:.3f} using weights from file: {}'.format(MSE_test_dB_avg, MSE_test_dB_avg_obs, model_file))
         # Print MSE Cross Validation
