@@ -315,6 +315,11 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
             training_logfile = "./log/knet_{}.log".format(model.rnn_type)
         else:
             training_logfile = logfile_path
+    else:
+        if logfile_path is None:
+            training_logfile = "./log/gs_training_knet_{}.log".format(model.rnn_type)
+        else:
+            training_logfile = logfile_path
 
     orig_stdout = sys.stdout
     f_tmp = open(training_logfile, 'a')
