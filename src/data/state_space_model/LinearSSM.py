@@ -1,8 +1,13 @@
-"""Linear state-space model utilities for dataset generation.
+"""Linear SSM utilities for synthetic trajectory generation.
 
-This module implements a configurable linear SSM used by the data generation
-pipeline. It was extracted from ``generate_data.py`` to decouple model
-definitions from the dataset tooling layer.
+项目背景 (Project Background):
+    该模块实现线性状态空间模型，用于生成训练 RNN/滤波器的数据集并支持 Kalman
+    系列算法验证。
+
+输入输出概览 (Input/Output Overview):
+    - 构造函数接收系统矩阵、噪声统计等，生成仿真所需的结构化对象。
+    - ``generate_single_sequence`` 基于噪声驱动返回状态矩阵 X ∈ ℝ^[T+1, m] 与观测
+      矩阵 Y ∈ ℝ^[T, n]。
 """
 
 from __future__ import annotations
@@ -16,14 +21,30 @@ from utils.tools import dB_to_lin, generate_normal
 
 
 class LinearSSM:
-    """Linear state-space model with optional control input.
+    """线性状态空间模型 / Linear state-space model with optional control input.
 
-    The dynamics follow
+    Args:
+        n_states (int): 状态维度 m。
+        n_obs (int): 观测维度 n。
+        F (np.ndarray | None): 状态转移矩阵 [m, m]，缺省时内部构造。
+        G (np.ndarray | None): 控制矩阵 [m, u]，可为 ``None``。
+        H (np.ndarray | None): 观测矩阵 [n, m]，缺省时内部构造。
+        mu_e (float | np.ndarray): 过程噪声均值 [m]。
+        mu_w (float | np.ndarray): 观测噪声均值 [n]。
+        q2 (float): 过程噪声方差标量，若 ``Q`` 未提供则使用。
+        r2 (float): 观测噪声方差标量，若 ``R`` 未提供则使用。
+        Q (np.ndarray | None): 过程噪声协方差 [m, m]。
+        R (np.ndarray | None): 观测噪声协方差 [n, n]。
 
-    x_{k+1} = F x_k + G u_k + e_k
-    y_k     = H x_k + w_k
+    Tensor Dimensions:
+        - x_k: [m]
+        - y_k: [n]
+        - X: [T+1, m]
+        - Y: [T, n]
 
-    where both ``e_k`` and ``w_k`` are Gaussian noises.
+    Math Notes:
+        - x_next = F @ x + G @ u + e
+        - y      = H @ x + w
     """
 
     def __init__(
@@ -59,12 +80,28 @@ class LinearSSM:
         self.R = R
 
         if self.Q is None and self.R is None:
+            # ==================================================================
+            # STEP 01: 初始化噪声协方差 (Noise covariance bootstrapping)
+            # ------------------------------------------------------------------
             self.init_noise_covs()
 
     def construct_F(self) -> np.ndarray:
-        """Construct a default transition matrix when none is provided."""
+        """构造缺省状态转移矩阵 / Build default transition matrix.
+
+        Returns:
+            np.ndarray: F ∈ ℝ^[m, m]。
+
+        Tensor Dimensions:
+            - F: [m, m]
+
+        Math Notes:
+            - F = I_m + offset，用于提供弱耦合动态。
+        """
 
         m = self.n_states
+        # ==================================================================
+        # STEP 01: 构造单位阵并拼接偏移 (Baseline + shift)
+        # ------------------------------------------------------------------
         F_sys = np.eye(m) + np.concatenate(
             (
                 np.zeros((m, 1)),
@@ -75,7 +112,7 @@ class LinearSSM:
         return F_sys
 
     def construct_H(self) -> np.ndarray:
-        """Construct a default observation matrix when none is provided."""
+        """构造缺省观测矩阵 / Build default observation matrix."""
 
         H_sys = np.rot90(np.eye(self.n_states, self.n_states)) + np.concatenate(
             (
@@ -90,13 +127,25 @@ class LinearSSM:
         return H_sys[: self.n_obs, : self.n_states]
 
     def init_noise_covs(self) -> None:
-        """Initialise process and measurement covariances."""
+        """初始化协方差矩阵 / Set Q, R as scaled identity."""
 
         self.Q = self.q2 * np.eye(self.n_states)
         self.R = self.r2 * np.eye(self.n_obs)
 
     def generate_driving_noise(self, k: int, a: float = 1.2, add_noise: bool = False) -> np.ndarray:
-        """Generate optional driving noise signal for control input."""
+        """生成驱动信号 / Optional control excitation.
+
+        Args:
+            k (int): 时间索引。
+            a (float): 正弦频率参数。
+            add_noise (bool): 是否在相位添加高斯噪声。
+
+        Returns:
+            np.ndarray: u_k ∈ ℝ^[1, 1]。
+
+        Math Notes:
+            - u_k = cos(a * (k + 1) + noise)
+        """
 
         if not add_noise:
             u_k = np.cos(a * (k + 1))
@@ -112,8 +161,34 @@ class LinearSSM:
         drive_noise: bool = False,
         add_noise_flag: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Simulate one trajectory of length ``T``."""
+        """生成一条长度 T 的状态与观测序列 / Simulate trajectory.
 
+        Args:
+            T (int): 序列长度。
+            inverse_r2_dB (float): 观测噪声逆功率 (dB)。
+            nu_dB (float): 过程与观测噪声比 (dB)。
+            drive_noise (bool): 是否注入驱动输入。
+            add_noise_flag (bool): 驱动相位是否加入噪声。
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - X_arr: 状态轨迹 X ∈ ℝ^[T+1, m]
+                - Y_arr: 观测轨迹 Y ∈ ℝ^[T, n]
+
+        Tensor Dimensions:
+            - e_k_arr: [T, m]
+            - w_k_arr: [T, n]
+
+        Math Notes:
+            - r2 = 1 / dB_to_lin(inverse_r2_dB)
+            - q2 = dB_to_lin(nu_dB - inverse_r2_dB)
+            - x_{k+1} = F @ x_k + G @ u_k + e_k
+            - y_k = H @ x_k + w_k
+        """
+
+        # ==================================================================
+        # STEP 01: 初始化存储张量与噪声统计 (Allocate buffers + noise stats)
+        # ------------------------------------------------------------------
         x_arr = np.zeros((T + 1, self.n_states))
         y_arr = np.zeros((T, self.n_obs))
 
@@ -123,9 +198,15 @@ class LinearSSM:
         self.q2 = q2
         self.init_noise_covs()
 
+        # ==================================================================
+        # STEP 02: 采样过程/观测噪声 (Draw noise samples)
+        # ------------------------------------------------------------------
         e_k_arr = generate_normal(N=T, mean=self.mu_e, Sigma2=self.Q)
         w_k_arr = generate_normal(N=T, mean=self.mu_w, Sigma2=self.R)
 
+        # ==================================================================
+        # STEP 03: 前向迭代生成状态与观测 (Rollout dynamics)
+        # ------------------------------------------------------------------
         for k in range(T):
             if drive_noise:
                 u_k = self.generate_driving_noise(k, a=1.2, add_noise=add_noise_flag)
@@ -141,4 +222,3 @@ class LinearSSM:
             y_arr[k] = self.H @ x_arr[k] + w_k
 
         return x_arr, y_arr
-

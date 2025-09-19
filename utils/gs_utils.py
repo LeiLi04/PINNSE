@@ -1,4 +1,12 @@
-"""Grid-search helper utilities for hyper-parameter sweeps."""
+"""Grid-search helper utilities for hyper-parameter sweeps.
+
+项目背景 (Project Background):
+    为 RNN/DANSE/PINN 等模型生成超参数组合，支撑自动化网格搜索实验。
+
+输入输出概览 (Input/Output Overview):
+    - 输入: 超参数候选字典 `param_dict` 与基础配置 `options`。
+    - 输出: 所有组合后的配置列表，可直接喂给训练脚本。
+"""
 
 from __future__ import annotations
 
@@ -7,24 +15,52 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Sequence
 
 
 def create_combined_param_dict(param_dict: Mapping[str, Sequence[Any]]) -> List[Dict[str, Any]]:
-    """Return the full cartesian product of hyper-parameter candidates.
+    """生成超参数笛卡尔组合 / Build full cartesian product.
 
     Args:
-        param_dict: Mapping from parameter name to an iterable of candidate
-            values. Each iterable must be non-empty.
+        param_dict (Mapping[str, Sequence[Any]]): 超参数候选集合，键为参数名。
+
+    Returns:
+        List[Dict[str, Any]]: 每个元素都是一次实验的参数字典。
+
+    Tensor Dimensions:
+        - param_dict[k]: [N_k]
+        - return: [Π N_k]
+
+    Math Notes:
+        combos = product(*param_dict.values())
     """
 
+    # ==================================================================
+    # STEP 01: 参数合法性检查 (Validate search space)
+    # ------------------------------------------------------------------
     if not param_dict:
         raise ValueError("param_dict must contain at least one parameter")
     keys, values = zip(*param_dict.items())
     for key, candidates in zip(keys, values):
         if len(candidates) == 0:
             raise ValueError(f"Parameter '{key}' has an empty candidate list")
+    # ==================================================================
+    # STEP 02: 生成组合 (Compute cartesian product)
+    # ------------------------------------------------------------------
     return [dict(zip(keys, combo)) for combo in product(*values)]
 
 
 def _copy_mapping(mapping: Mapping[str, Any]) -> Dict[str, Any]:
-    """Shallow copy mapping, cloning nested dicts to avoid mutation leaks."""
+    """浅拷贝字典 / Clone mapping to avoid mutation leaks.
+
+    Args:
+        mapping (Mapping[str, Any]): 原始配置字典。
+
+    Returns:
+        Dict[str, Any]: 浅拷贝结果，嵌套 dict 同样复制。
+
+    Tensor Dimensions:
+        - 不涉及张量。
+
+    Math Notes:
+        无数学运算。
+    """
 
     cloned: Dict[str, Any] = {}
     for key, value in mapping.items():
@@ -40,15 +76,26 @@ def create_list_of_dicts(
     model_type: str,
     param_dict: Mapping[str, Sequence[Any]],
 ) -> List[Dict[str, Any]]:
-    """Expand ``options`` with all hyper-parameter combinations for ``model_type``.
+    """合成完整实验配置 / Merge base options with hyper-parameter combos.
 
     Args:
-        options: Baseline configuration dictionary that must include an
-            ``'rnn_params_dict'`` entry.
-        model_type: Key inside ``options['rnn_params_dict']`` to be augmented.
-        param_dict: Hyper-parameter search space per ``create_combined_param_dict``.
+        options (Mapping[str, Any]): 基础配置，需包含 `rnn_params_dict`。
+        model_type (str): 目标模型类型键（如 "gru"）。
+        param_dict (Mapping[str, Sequence[Any]]): 超参数候选集合。
+
+    Returns:
+        List[Dict[str, Any]]: 合并后的配置列表。
+
+    Tensor Dimensions:
+        - return: [Π N_k]
+
+    Math Notes:
+        cfg_model_params = base_params.copy(); cfg_model_params.update(combo)
     """
 
+    # ==================================================================
+    # STEP 01: 校验基础配置 (Validate base options)
+    # ------------------------------------------------------------------
     if "rnn_params_dict" not in options:
         raise KeyError("options must contain 'rnn_params_dict'")
 
@@ -59,6 +106,9 @@ def create_list_of_dicts(
     combinations = create_combined_param_dict(param_dict)
     expanded_configs: List[Dict[str, Any]] = []
 
+    # ==================================================================
+    # STEP 02: 合并每个组合 (Merge each hyper-parameter combo)
+    # ------------------------------------------------------------------
     for combo in combinations:
         cfg = _copy_mapping(options)
         cfg_rnn_dict = _copy_mapping(cfg.setdefault("rnn_params_dict", {}))
