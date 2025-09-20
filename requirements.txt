@@ -1,0 +1,21 @@
+# Final pip requirements for Windows, Python 3.11 (recommend using a conda env named `kalman311`)
+# Top-level packages only; indirect deps (contourpy, kiwisolver, fonttools, pyparsing, python-dateutil, etc.)
+# will be resolved automatically by pip with compatible versions.
+
+numpy>=1.26
+pandas>=2.2
+scipy>=1.11
+matplotlib>=3.9
+scikit-learn>=1.3
+
+filterpy==1.4.5
+bottleneck>=1.3
+numexpr>=2.8
+networkx>=3.2
+mpmath>=1.3
+pillow>=10.0
+brotli>=1.0
+tzdata>=2024.1
+jinja2>=3.1
+tornado>=6.3
+webcolors>=24.0

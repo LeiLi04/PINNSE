@@ -5,6 +5,9 @@ __pycache__/
 
 # C extensions
 *.so
+*.pyd
+*.dll
+*.dylib
 
 # Distribution / packaging
 .Python
@@ -143,6 +146,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+!.requirements
+
+
 
 # Spyder project settings
 .spyderproject
@@ -187,6 +193,9 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #  you could uncomment the following to ignore the entire vscode folder
 # .vscode/
+.vscode/*
+!.vscode/settings.json     # 保留共享的 Python 解释器配置
+!.vscode/extensions.json   # 保留推荐扩展
 
 # Ruff stuff:
 .ruff_cache/
@@ -205,3 +214,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
