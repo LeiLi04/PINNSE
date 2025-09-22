@@ -203,7 +203,7 @@ def generate_state_observation_pairs(type_, parameters, T=200, N_samples=1000):
     return Z_XY
 
 
-def create_filename(T, N_samples, m, n, type_, inverse_r2_dB, nu_dB, dataset_basepath = './data/trajectories'):
+def create_filename(T, N_samples, m, n, type_, inverse_r2_dB, nu_dB, dataset_basepath = "src/data/trajectories"):
     """
     基于核心超参数创建数据文件名 (便于溯源与区分)。
     Args:
@@ -254,6 +254,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Create datasets by simulating state space models."
     )
+    '''
+             class Args:
+                 n_states = 3
+                 n_obs = 3
+                 num_samples = 100
+                 sequence_length = 1000
+                  | (1/r^2) [dB] | r^2 [dB] | r^2 (线性) | ν [dB] |   ν (线性)   |
+                  |-------------:|---------:|-----------:|-------:|-------------:|
+                  |          -20 |      +20 |       100  |   -30  |   0.001      |
+                  |          -10 |      +10 |        10  |   -20  |   0.01       |
+                  |           -5 |       +5 |     3.1623 |   -15  |   0.0316     |
+                  |            0 |        0 |         1  |   -10  |   0.1        |
+                  |            5 |       -5 |     0.3162 |    -5  |   0.3162     |
+                  |           10 |      -10 |       0.1  |     0  |   1          |
+                  |           20 |      -20 |      0.01  |    10  |   10         |
+                 inverse_r2_dB = -40
+                 nu_dB = -50
+                 dataset_type = 'LorenzSSM'
+                 # output_path = './data'
+                 output_path = './eval_sets/Lorenz_Atractor/T1000_NT100/' + '/'
+    '''
     parser.add_argument("--n_states", type=int, default=3, help="Latent state dimension")
     parser.add_argument("--n_obs", type=int, default=3, help="Observation dimension")
     parser.add_argument("--num_samples", type=int, default=500, help="Number of trajectories to simulate")
@@ -267,7 +288,7 @@ if __name__ == "__main__":
         choices=SUPPORTED_DATASET_TYPES,
         help="Which SSM to simulate",
     )
-    parser.add_argument("--output_path", type=str, default='./data/trajectories', help="Directory to store the generated dataset")
+    parser.add_argument("--output_path", type=str, default="src/data/trajectories", help="Directory to store the generated dataset")
     args = parser.parse_args()
 
     n_states = args.n_states
