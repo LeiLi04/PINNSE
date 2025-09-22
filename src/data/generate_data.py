@@ -11,11 +11,11 @@
     - 命令行参数：n_states, n_obs, num_samples, sequence_length, inverse_r2_dB, nu_dB, dataset_type, output_path
     - 支持多种SSM结构及其参数
 输出:
-    - 生成并保存标准化的数据集文件（PKL），内容为状态-观测对 [T, D] × N_samples
+    - 生成并保存标准化的数据集文件（PKL），内容为状态/观测对 [T, D] × N_samples
 
 张量维度/数据结构说明:
     - 每条数据 [X, Y]: [T, n_states], [T, n_obs]
-    - 数据集内容: Z_XY["data"]: [N_samples, 2] (object数组, 每行为[X, Y])
+    - 数据集内的 Z_XY["data"]: [N_samples, 2] (object数组, 每行为[X, Y])
 
 典型应用场景:
     - 状态估计算法、深度序列模型、RNN训练及基准实验
@@ -23,7 +23,7 @@
 """
 
 # ==========================================================================
-# STEP 01: 导入依赖库
+# STEP 01: 导入依赖
 # ==========================================================================
 import numpy as np
 import scipy
@@ -46,97 +46,16 @@ from .state_space_model.LinearSSM import LinearSSM
 from .state_space_model.LorenzAttractorModel import LorenzAttractorModel
 from .state_space_model.SinusoidalSSM import SinusoidalSSM
 
-'''
-# ==========================================================================
-# STEP 00: Dummy or Missing Imports from Original Code
-# ==========================================================================
-# 说明: 若原工程未提供 parameters 模块, 这里提供占位实现确保脚本可运行。
 try:
-    from parameters import get_parameters, A_fn, h_fn, J_gen, delta_t
+    from ..parameters import get_parameters
 except ImportError:
-    print("Warning: 'parameters' module not found. Using dummy implementations.")
+    SRC_DIR = Path(__file__).resolve().parents[1]
+    if str(SRC_DIR) not in sys.path:
+        sys.path.append(str(SRC_DIR))
+    from parameters import get_parameters
 
-    def get_parameters(N=1000, T=200, n_states=3, n_obs=3, inverse_r2_dB=40, nu_dB=0, device='cpu'):
-        """获取各模型参数占位实现。
-        Args:
-            N (int): number of samples.
-            T (int): trajectory length.
-            n_states (int): state dimension.
-            n_obs (int): observation dimension.
-            inverse_r2_dB (float): inverse measurement noise power in dB.
-            nu_dB (float): process vs measurement noise ratio in dB.
-            device (str): device name, not used in dummy.
-        Returns:
-            tuple(dict, dict): (ssm_params, est_params).
-        Tensor Dimensions:
-            - LinearSSM: F [m,m], H [n,m], Q [m,m], R [n,n].
-        Math Notes:
-            - r2_lin = 10^(inverse_r2_dB/10); r2 = 1/r2_lin
-            - q2 = 10^((nu_dB - inverse_r2_dB)/10)
-        """
-        r2_lin = 10**(inverse_r2_dB/10)
-        r2 = 1/r2_lin
-        q2 = 10**((nu_dB - inverse_r2_dB)/10)
-        # ============== 嵌套定义 Lorenz A_fn 工厂 ==================
-        def make_lorenz_A_fn(sigma=10.0, rho=28.0, beta=8/3):
-          def A_fn(state):
-              s = np.asarray(state).reshape(-1)
-              X, Y, Z = s[0], s[1], s[2]
-              return np.array([
-                  [-sigma,  sigma,   0.0],
-                  [ rho - Z, -1.0,  -X  ],
-                  [   Y,      X,   -beta]
-              ], dtype=float)
-          return A_fn
-        def make_h_fn_identity(n_obs, n_states):
-          H = np.eye(n_states)[:n_obs, :]
-          def h_fn(x):
-              x = np.asarray(x).reshape(-1)
-              return H @ x
-          return h_fn
+SUPPORTED_DATASET_TYPES = ("LinearSSM", "LorenzSSM", "SinusoidalSSM")
 
-        # 在 get_parameters 里：
-        h_fn = make_h_fn_identity(n_obs, n_states)
-
-        # 使用时：
-        A_fn = make_lorenz_A_fn()
-
-        ssm_params = {
-            "LinearSSM": {
-                "n_states": n_states, "n_obs": n_obs, "F": np.eye(n_states), "G": np.zeros((n_states, 1)),
-                "H": np.eye(n_obs, n_states), "mu_e": np.zeros(n_states), "mu_w": np.zeros(n_obs),
-                "q2": q2, "r2": r2, "Q": q2 * np.eye(n_states), "R": r2 * np.eye(n_obs)
-            },
-            "LorenzSSM": {
-                "n_states": n_states, "n_obs": n_obs, "J": 5, "delta": 0.02, "A_fn": A_fn, "h_fn": h_fn,
-                "delta_d": 0.02, "decimate": False, "mu_e": np.zeros(n_states), "mu_w": np.zeros(n_obs),
-                "inverse_r2_dB": inverse_r2_dB, "nu_dB": nu_dB, "use_Taylor": True
-            },
-            "SinusoidalSSM": {
-                "n_states": n_states, "alpha": 0.9, "beta": 1.1, "phi": 0.1*math.pi, "delta": 0.01,
-                "a": 1.0, "b": 1.0, "c": 0.0, "decimate": False, "mu_e": np.zeros(n_states), "mu_w": np.zeros(n_obs),
-                "inverse_r2_dB": inverse_r2_dB, "nu_dB": nu_dB, "use_Taylor": False
-            }
-        }
-        est_params = {
-            "danse": {"batch_size": 64, "rnn_type": "gru", "rnn_params_dict": {"gru": {"lr": 1e-3, "num_epochs": 2000, "n_hidden": 40, "n_layers": 2, "min_delta": 1e-2, "n_hidden_dense": 32}}},
-            "KF": {}, "EKF": {}, "UKF": {}, "KNetUoffline": {}
-        }
-        return ssm_params, est_params
-
-
-    def h_fn(z):
-        """恒等观测占位实现。
-        Args:
-            z (array-like): state vector.
-        Returns:
-            np.ndarray: observation vector, same shape as input.
-        """
-        return z
-
-    J_gen = 5
-
-'''
 
 def initialize_model(type_, parameters):
     """
@@ -190,6 +109,7 @@ def initialize_model(type_, parameters):
         )
     return model
 
+
 def generate_SSM_data(model, T, parameters):
     """
     生成单条 SSM 序列 (X, Y)。
@@ -225,10 +145,11 @@ def generate_SSM_data(model, T, parameters):
         )
     return X_arr, Y_arr
 
-#+++++++++++++++++修改过++++++++++++++++++++
+
+#+++++++++++++++++修改开始+++++++++++++++++++++
 def generate_state_observation_pairs(type_, parameters, T=200, N_samples=1000):
     """
-    批量生成 N_samples 条 (X, Y) 状态-观测对。
+    批量生成 N_samples 对 (X, Y) 状态/观测对。
     Args:
         type_ (str): SSM type.
         parameters (dict): SSM parameters for the given type.
@@ -275,13 +196,14 @@ def generate_state_observation_pairs(type_, parameters, T=200, N_samples=1000):
         Z_XY_data.append([Xi, Yi])
 
     # ==========================================================================
-    # STEP 02: 打包为 object 数组, 兼容不同形状
+    # STEP 02: 打包成object 数组, 兼容不同形状
     # ==========================================================================
     Z_XY["data"] = np.array(Z_XY_data, dtype=object)  # 每行 [Xi, Yi]
-    Z_XY["trajectory_lengths"] = np.array(Z_XY_data_lengths)
+    Z_XY["trajectory_lengths"] = np.array(Z_XY_data_lengths)    # 每条序列长度 T
     return Z_XY
 
-def create_filename(T, N_samples, m, n, type_, inverse_r2_dB, nu_dB, dataset_basepath = './data/'):
+
+def create_filename(T, N_samples, m, n, type_, inverse_r2_dB, nu_dB, dataset_basepath = './data/trajectories'):
     """
     基于核心超参数创建数据文件名 (便于溯源与区分)。
     Args:
@@ -302,7 +224,8 @@ def create_filename(T, N_samples, m, n, type_, inverse_r2_dB, nu_dB, dataset_bas
     dataset_fullpath = os.path.join(dataset_basepath, datafile)
     return dataset_fullpath
 
-def create_and_save_dataset(T, N_samples, filename, parameters, type_="LinearSSM"):
+
+def create_and_save_dataset(T, N_samples, filename, parameters, type_="LorenzSSM"):
     """
     一键生成并保存 SSM 数据集到磁盘 (pickle)。
     Args:
@@ -326,87 +249,73 @@ def create_and_save_dataset(T, N_samples, filename, parameters, type_="LinearSSM
     with open(filename, 'wb') as f:
         pickle.dump(Z_XY, f)
 
-# if __name__ == "__main__":
-#     # ==========================================================================
-#     # STEP 02: 命令行参数解析与准备
-#     # ==========================================================================
-#     usage = (
-#         "Create datasets by simulating state space models \n"
-#         "python generate_data.py --sequence_length T --num_samples N --dataset_type [LinearSSM/LorenzSSM] --output_path [output path name]\n"
-#         "Creates the dataset at the location output_path"
-#     )
 
-#     if 'ipykernel' in sys.modules:
-#         # 在 notebook 环境, 手动设定参数
-#         # './eval_sets/Lorenz_Atractor/T1000_NT100/' + '/' dataFileName
-#         class Args:
-#             n_states = 3
-#             n_obs = 3
-#             num_samples = 100
-#             sequence_length = 1000
-#             '''
-#             # | (1/r^2) [dB] | r^2 [dB] | r^2 (线性) | ν [dB] |   ν (线性)   |
-#             # |-------------:|---------:|-----------:|-------:|-------------:|
-#             # |          -20 |      +20 |       100  |   -30  |   0.001      |
-#             # |          -10 |      +10 |        10  |   -20  |   0.01       |
-#             # |           -5 |       +5 |     3.1623 |   -15  |   0.0316     |
-#             # |            0 |        0 |         1  |   -10  |   0.1        |
-#             # |            5 |       -5 |     0.3162 |    -5  |   0.3162     |
-#             # |           10 |      -10 |       0.1  |     0  |   1          |
-#             # |           20 |      -20 |      0.01  |    10  |   10         |
-#             '''
-#             inverse_r2_dB = -40
-#             nu_dB = -50
-#             dataset_type = 'LorenzSSM'
-#             # output_path = './data'
-#             output_path = './eval_sets/Lorenz_Atractor/T1000_NT100/' + '/'
-#         args = Args()
-#     else:
-#         parser = argparse.ArgumentParser(description="Input arguments related to creating a dataset for training RNNs")
-#         parser.add_argument("--n_states", help="denotes the number of states in the latent model", type=int, default=5)
-#         parser.add_argument("--n_obs", help="denotes the number of observations", type=int, default=5)
-#         parser.add_argument("--num_samples", help="denotes the number of trajectories to be simulated for each realization", type=int, default=500)
-#         parser.add_argument("--sequence_length", help="denotes the length of each trajectory", type=int, default=200)
-#         parser.add_argument("--inverse_r2_dB", help="denotes the inverse of measurement noise power", type=float, default=40.0)
-#         parser.add_argument("--nu_dB", help="denotes the ration between process and measurement noise", type=float, default=0.0)
-#         parser.add_argument("--dataset_type", help="specify mode=pfixed (all theta, except theta_3, theta_4) / vars (variances) / all (full theta vector)", type=str, default=None)
-#         parser.add_argument("--output_path", help="Enter full path to store the data file", type=str, default=None)
-#         args = parser.parse_args()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Create datasets by simulating state space models."
+    )
+    parser.add_argument("--n_states", type=int, default=3, help="Latent state dimension")
+    parser.add_argument("--n_obs", type=int, default=3, help="Observation dimension")
+    parser.add_argument("--num_samples", type=int, default=500, help="Number of trajectories to simulate")
+    parser.add_argument("--sequence_length", type=int, default=200, help="Length of each trajectory")
+    parser.add_argument("--inverse_r2_dB", type=float, default=40.0, help="Inverse measurement noise power in dB")
+    parser.add_argument("--nu_dB", type=float, default=0.0, help="Process/measurement noise ratio in dB")
+    parser.add_argument(
+        "--dataset_type",
+        type=str,
+        default="LorenzSSM",
+        choices=SUPPORTED_DATASET_TYPES,
+        help="Which SSM to simulate",
+    )
+    parser.add_argument("--output_path", type=str, default='./data/trajectories', help="Directory to store the generated dataset")
+    args = parser.parse_args()
 
-#     # ==========================================================================
-#     # STEP 03: 参数读取与数据集路径生成
-#     # ==========================================================================
-#     n_states = args.n_states
-#     n_obs = args.n_obs
-#     T = args.sequence_length
-#     N_samples = args.num_samples
-#     type_ = args.dataset_type
-#     output_path = args.output_path
-#     inverse_r2_dB = args.inverse_r2_dB
-#     nu_dB = args.nu_dB
+    n_states = args.n_states
+    n_obs = args.n_obs
+    T = args.sequence_length
+    N_samples = args.num_samples
+    dataset_type = args.dataset_type
+    inverse_r2_dB = args.inverse_r2_dB
+    nu_dB = args.nu_dB
 
-#     # ✅ 自动创建输出目录（Colab友好）
-#     if output_path is not None and not os.path.exists(output_path):
-#         print(f"Creating output directory at {output_path} ...")
-#         os.makedirs(output_path)
+    default_base = Path(__file__).resolve().parents[2] / "data"
+    base_path = Path(args.output_path) if args.output_path else default_base
+    base_path.mkdir(parents=True, exist_ok=True)
 
-#     datafilename = create_filename(
-#         T=T, N_samples=N_samples, m=n_states, n=n_obs,
-#         type_=type_, inverse_r2_dB=inverse_r2_dB, nu_dB=nu_dB, dataset_basepath=output_path)  # Corrected order
+    datafilename = create_filename(
+        T=T,
+        N_samples=N_samples,
+        m=n_states,
+        n=n_obs,
+        type_=dataset_type,
+        inverse_r2_dB=inverse_r2_dB,
+        nu_dB=nu_dB,
+        dataset_basepath=str(base_path),
+    )
 
-#     # ✅ 获取模型参数 (若为占位实现, 仅用于示例)
-#     ssm_parameters, _ = get_parameters(
-#         N=N_samples, T=T, n_states=n_states, n_obs=n_obs,
-#         inverse_r2_dB=inverse_r2_dB, nu_dB=nu_dB)
+    ssm_parameters, _ = get_parameters(
+        N=N_samples,
+        T=T,
+        n_states=n_states,
+        n_obs=n_obs,
+        inverse_r2_dB=inverse_r2_dB,
+        nu_dB=nu_dB,
+    )
 
-#     # ==========================================================================
-#     # STEP 04: 数据集生成与保存（避免重复生成）
-#     # ==========================================================================
-#     if not os.path.isfile(datafilename):
-#         print("Creating the data file: {}".format(datafilename))
-#         create_and_save_dataset(
-#             T=T, N_samples=N_samples, filename=datafilename,
-#             type_=type_, parameters=ssm_parameters[type_])
-#     else:
-#         print("Dataset {} is already present!".format(datafilename))
-#     print("Done...")
+    if dataset_type not in ssm_parameters:
+        available = ", ".join(sorted(ssm_parameters.keys()))
+        raise ValueError(f"Unknown dataset_type {dataset_type!r}. Available: {available}")
+
+    if not os.path.isfile(datafilename):
+        print(f"Creating the data file: {datafilename}")
+        create_and_save_dataset(
+            T=T,
+            N_samples=N_samples,
+            filename=datafilename,
+            parameters=ssm_parameters[dataset_type],
+            type_=dataset_type,
+        )
+    else:
+        print(f"Dataset {datafilename} is already present!")
+
+    print("Done...")
