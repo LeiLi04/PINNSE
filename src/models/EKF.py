@@ -26,6 +26,7 @@ def lin_to_dB(x_lin: float, eps: float = 1e-12) -> float:
 def mse_loss(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.mean((a - b) ** 2)
 
+#   ------- Numerical Jacobian (Central Difference) ----------
 def numerical_jacobian_central(func, x: np.ndarray, dt: float = None, eps: float = 1e-5):
     x = np.asarray(x, dtype=float)
     n = x.size
@@ -124,7 +125,32 @@ class EKF_Lorenz(nn.Module):
         else:
             self.P = torch.from_numpy(np.asarray(P0)).float().to(self.device)
 
+
+    # =========================Transition State===================================================
     # ----- 预测 -----
+    # ---------- EKF Prediction step ----------
+    # 数学公式说明：
+    #
+    # 状态预测：
+    #   一阶近似 (order=1):
+    #       x_{k+1} ≈ x_k + Δt f(x_k)
+    #   二阶近似 (order=2):
+    #       x_{k+1} ≈ x_k + Δt f(x_k) + 1/2 Δt^2 J(x_k) f(x_k)
+    #
+    # 状态转移矩阵 F：
+    #   一阶近似 (order=1):
+    #       F_k ≈ I + Δt J(x_k)
+    #   二阶近似 (order=2):
+    #       F_k ≈ I + Δt J(x_k) + 1/2 (Δt J(x_k))^2
+    #
+    # 协方差传播：
+    #       P_{k+1} = F_k P_k F_k^T + Q
+    #
+    # 其中：
+    #   f(x)   : 连续时间动力学 (Lorenz-63)
+    #   J(x)   : f(x) 的 Jacobian
+    #   Δt     : 时间步长 self.dt
+    #   Q      : 过程噪声协方差
     def predict_step(self):
         x_np = self.x.detach().cpu().numpy()
         f = self.f(x_np)                       # R^nx
@@ -133,7 +159,7 @@ class EKF_Lorenz(nn.Module):
         J_t = torch.from_numpy(J).float().to(self.device)
 
         if self.order == 1:
-            F = I + self.dt * J_t
+            F = I + self.dt * J_t  
             x_pred = self.x + self.dt * torch.from_numpy(f).float().to(self.device)
         elif self.order == 2:
             Jdt = self.dt * J_t
@@ -150,6 +176,18 @@ class EKF_Lorenz(nn.Module):
         return F  # 便于调试/保存
 
     # ----- 更新（Joseph + Cholesky） -----
+    # ---------- 协方差更新 (Joseph form) ----------
+    # 数学公式：
+    #
+    #   P_k+ = (I - K_k H_k) P_k- (I - K_k H_k)^T + K_k R_k K_k^T
+    #
+    # 其中：
+    #   P_k- : 先验协方差
+    #   P_k+ : 后验协方差
+    #   K_k  : 卡尔曼增益
+    #   H_k  : 观测矩阵
+    #   R_k  : 观测噪声协方差
+
     def update_step(self, z_k: np.ndarray, return_diag=False):
         H = self.H_torch
         z_pred = H @ self.x if self.h is None else torch.from_numpy(self.h(self.x.detach().cpu().numpy())).float().to(self.device)
@@ -158,12 +196,14 @@ class EKF_Lorenz(nn.Module):
         S = H @ self.P @ H.T + self.R
         S = 0.5 * (S + S.T) + self.jitter * torch.eye(self.nz, device=self.device)
         L = torch.linalg.cholesky(S)
-
+        
+        # 计算 Kalman 增益
         # K = P H^T S^{-1} via Cholesky
         HP = H @ self.P                      # (nz,nx)
         U = torch.cholesky_solve(HP, L)      # S^{-1} (H P)
         K = U.T                              # (nx,nz)
 
+        # 更新
         self.x = self.x + K @ innov
         I = torch.eye(self.nx, device=self.device)
         P_post = (I - K @ H) @ self.P @ (I - K @ H).T + K @ self.R @ K.T
@@ -218,7 +258,7 @@ class EKF_Lorenz(nn.Module):
         Y,                      # np.array [N, T, n_obs]
         X_gt=None,              # np.array [N, T, n_states]（评估用，可 None）
         H=None,                 # np.array [n_obs, n_states]，默认 I
-        delta_t=0.01,
+        delta_t=0.01,           # 时间步长
         inverse_r2_dB=None,     # (1/r^2)_dB
         nu_dB=None,             # 固定 Q=-10dB 时：nu_dB = inverse_r2_dB - 10
         order=1,
@@ -264,7 +304,7 @@ class EKF_Lorenz(nn.Module):
             P_hat[i] = Phat_i.cpu().numpy()
             nis_list.append(stats["NIS_mean"])
             if "mse_lin" in stats: mse_list.append(stats["mse_lin"])
-
+        # 汇总输出， if 有 X 则加上,  否则只输出 /hat{x}, /hat{P}, NIS
         out = {
             "X_hat": X_hat,
             "P_hat": P_hat,
