@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import math
@@ -13,13 +13,20 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
-from src.parameters import get_parameters, get_H_DANSE
+from importlib import import_module
+import sys
+
+CURRENT_DIR = Path(__file__).resolve().parent
+PARENTS = CURRENT_DIR.parents
+PROJECT_ROOT = PARENTS[2] if len(PARENTS) >= 3 else CURRENT_DIR
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 try:
     import yaml
 except ImportError as exc:
     raise ImportError("Please install pyyaml to load configuration files.") from exc
-
 
 def load_config(path: Path, overrides: Optional[Dict] = None) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -114,6 +121,9 @@ def create_dataloaders(
 
 def prepare_parameters(config: Dict, device: torch.device) -> Dict:
     data_cfg = config["data"]
+    parameters_module = import_module("src.parameters")
+    get_parameters = getattr(parameters_module, "get_parameters")
+    get_H_DANSE = getattr(parameters_module, "get_H_DANSE")
     ssm_params, _ = get_parameters(
         N=data_cfg.get("N_train", 1024),
         T=data_cfg["T"],

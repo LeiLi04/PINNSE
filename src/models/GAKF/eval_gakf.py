@@ -13,7 +13,7 @@ for path in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, str(path))
 
 from src.models.GAKF.generator import GAKFGenerator
-from src.models.GAKF import utils
+import src.models.GAKF.utils as utils
 
 import matplotlib.pyplot as plt
 import numpy as np

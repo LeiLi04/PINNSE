@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
@@ -81,7 +81,7 @@ class GAKFGenerator(nn.Module):
 
         self.reset_parameters()
 
-        # θ̄ snapshot for APBM loss
+        # snapshot for APBM loss
         self.register_buffer("theta_bar", self._get_parameter_vector().detach().clone())
 
     def reset_parameters(self) -> None:
@@ -96,7 +96,7 @@ class GAKFGenerator(nn.Module):
         return torch.cat([p.detach().flatten() for p in self.parameters()])
 
     def update_theta_bar(self, momentum: float = 0.0) -> None:
-        """Update θ̄ snapshot with simple exponential moving average."""
+        """Update snapshot with simple exponential moving average."""
         with torch.no_grad():
             current = self._get_parameter_vector()
             self.theta_bar = momentum * self.theta_bar + (1.0 - momentum) * current
@@ -188,7 +188,7 @@ class GAKFGenerator(nn.Module):
         mu_prior_vec = mu_prior.unsqueeze(-1)  # [B, T, n_states, 1]
         y_vec = y_seq.unsqueeze(-1)  # [B, T, n_obs, 1]
 
-        # Compute innovation: ν_t = y_t - H μ_t^-
+        # Compute innovation: _t = y_t - H _t^-
         H_mu_prior = torch.matmul(H, mu_prior_vec)  # [B, T, n_obs, 1]
         innovation = (y_vec - H_mu_prior).squeeze(-1)  # [B, T, n_obs]
 
@@ -208,12 +208,12 @@ class GAKFGenerator(nn.Module):
         )  # [B, T, n_obs, n_states]
         K = solve.transpose(-1, -2)  # [B, T, n_states, n_obs]
 
-        # Whitened innovation ν̃ = L^{-1} ν
+        # Whitened innovation ? = L^{-1} 
         innovation_white = torch.cholesky_solve(
             innovation.unsqueeze(-1), chol_S
         ).squeeze(-1)  # [B, T, n_obs]
 
-        # Posterior mean μ^+ = μ^- + K ν
+        # Posterior mean ^+ = ^- + K 
         mu_post = (mu_prior_vec + torch.matmul(K, innovation.unsqueeze(-1))).squeeze(-1)
 
         # Posterior covariance via Joseph form: P^+ = (I - K H) P^- (I - K H)^T + K R K^T
@@ -260,13 +260,14 @@ class GAKFGenerator(nn.Module):
         P_prev = outs.P_post[:, -1, :]
 
         for _ in range(horizon):
-            rnn_input = last_y  # use predicted observation
+            rnn_input = last_y  # 当前步以上一预测作输入
             rnn_out, h = self.rnn(rnn_input, h)
 
             mu_prior = self.head_mean(rnn_out)
             logvar_prior = self.head_logvar(rnn_out)
             P_prior = torch.nn.functional.softplus(logvar_prior) + self.cov_eps
 
+            pseudo_obs = last_y  # 直接使用上一时刻预测当作伪观测
             (
                 mu_post,
                 P_post_diag,
@@ -276,9 +277,12 @@ class GAKFGenerator(nn.Module):
                 _,
                 _,
                 _,
-            ) = self._kalman_filter_update(mu_prior, P_prior, y_hat)  # using y_hat as pseudo observation
+            ) = self._kalman_filter_update(mu_prior, P_prior, pseudo_obs)
+
             preds.append(y_hat)
-            last_y = y_hat
+            last_y = y_hat  # 下一步继续用最新预测
+
+
             x_prev = mu_post.squeeze(1)
             P_prev = P_post_diag.squeeze(1)
 
