@@ -7,12 +7,13 @@ Adjust the configuration block near the top of main() as needed.
 
 from __future__ import annotations
 
+import argparse
 import json
 import pickle
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from parse import parse
@@ -165,17 +166,48 @@ def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def main() -> None:
-    mode = "train"  # or "test"
-    model_type = "gru"
-    dataset_type = "LorenzSSM"
-    data_filename = "trajectories_m_3_n_3_LorenzSSM_data_T_200_N_500_r2_0.0dB_nu_-10.0dB.pkl"
-    splits_filename = "trajectories_m_3_n_3_LorenzSSM_data_T_200_N_500_r2_0.0dB_nu_-10.0dB_split.pkl"
-    checkpoint_name = "knet_ckpt_epoch_best.pt"
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="KalmanNet training/testing entry point")
+    parser.add_argument("--mode", choices=["train", "test"], default="train", help="Run training or testing pipeline")
+    parser.add_argument("--model-type", default="gru", help="Recurrent core type for KalmanNet (e.g. gru, lstm)")
+    parser.add_argument("--dataset-type", default="LorenzSSM", help="State-space model identifier")
+    parser.add_argument("--dataset", default="trajectories_m_3_n_3_LorenzSSM_data_T_200_N_500_r2_0.0dB_nu_-10.0dB.pkl",
+                        help="Path or name of the dataset pickle")
+    parser.add_argument("--splits", default=None,
+                        help="Optional path/name for train/val/test split pickle (defaults to <dataset>_split.pkl)")
+    parser.add_argument("--checkpoint", default="knet_ckpt_epoch_best.pt",
+                        help="Checkpoint filename to load/save (under models/<run_name>)")
+    parser.add_argument("--device", default=None, help="Computation device string, e.g. cuda:0 or cpu")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override batch size from estimator config")
+    parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
+    parser.add_argument("--layers", type=int, default=None, help="Override number of RNN layers")
+    parser.add_argument("--supervised", dest="unsupervised", action="store_false",
+                        help="Force supervised training even if config defaults to unsupervised")
+    parser.add_argument("--unsupervised", dest="unsupervised", action="store_true",
+                        help="Force unsupervised training regardless of config")
+    parser.set_defaults(unsupervised=None)
 
-    data_path = (PROJECT_ROOT / "src" / "data" / "trajectories" / data_filename).resolve()
-    if not data_path.suffix:
-        data_path = data_path.with_suffix(".pkl")
+    args = parser.parse_args(argv)
+
+    mode = args.mode
+    model_type = args.model_type
+    dataset_type = args.dataset_type
+
+    dataset_arg = Path(args.dataset)
+    if not dataset_arg.suffix:
+        dataset_arg = dataset_arg.with_suffix(".pkl")
+
+    candidate_paths = []
+    if dataset_arg.is_absolute():
+        candidate_paths.append(dataset_arg)
+    else:
+        candidate_paths.extend([
+            PROJECT_ROOT / "src" / "data" / "trajectories" / dataset_arg,
+            PROJECT_ROOT / dataset_arg,
+            dataset_arg,
+        ])
+
+    data_path = next((p.resolve() for p in candidate_paths if p.exists()), candidate_paths[0].resolve())
     if not data_path.exists():
         print(f"Dataset not found: {data_path}")
         return
@@ -191,7 +223,10 @@ def main() -> None:
     inverse_r2_dB = to_float(inverse_r2_token)
     nu_dB = to_float(nu_token)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if args.device is not None:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     ssm_parameters_dict, est_parameters_dict = get_parameters(
@@ -205,15 +240,28 @@ def main() -> None:
     )
 
     estimator_options = est_parameters_dict["KNetUoffline"].copy()
-    batch_size = estimator_options.get("batch_size", 100)
-    num_epochs = estimator_options.get("num_epochs", 100)
-    n_layers = estimator_options.get("n_layers", 1)
-    unsupervised = estimator_options.get("unsupervised", True)
+    batch_size = args.batch_size or estimator_options.get("batch_size", 100)
+    num_epochs = args.epochs or estimator_options.get("num_epochs", 100)
+    n_layers = args.layers or estimator_options.get("n_layers", 1)
+    if args.unsupervised is None:
+        unsupervised = estimator_options.get("unsupervised", True)
+    else:
+        unsupervised = args.unsupervised
 
     dataset_dict = load_saved_dataset(data_path)
     dataset = SeriesDataset(dataset_dict)
 
-    splits_path = create_splits_file_name(data_path, splits_filename)
+    if args.splits:
+        splits_arg = Path(args.splits)
+        if not splits_arg.suffix:
+            splits_arg = splits_arg.with_suffix(".pkl")
+        if splits_arg.is_absolute():
+            splits_path = splits_arg
+        else:
+            splits_path = (data_path.parent / splits_arg).resolve()
+    else:
+        splits_path = data_path.with_name(f"{data_path.stem}_split.pkl")
+
     if splits_path.exists():
         splits = load_splits_file(splits_path)
         train_idx, val_idx, test_idx = splits["train"], splits["val"], splits["test"]
@@ -242,6 +290,8 @@ def main() -> None:
 
     training_logfile = log_dir / "training.log"
     testing_logfile = log_dir / "testing.log"
+
+    checkpoint_name = args.checkpoint
 
     ssm_params = ssm_parameters_dict.get(dataset_type, {})
     initial_state = dataset.initial_state()

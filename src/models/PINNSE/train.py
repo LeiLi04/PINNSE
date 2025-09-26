@@ -1,3 +1,47 @@
+from __future__ import annotations
+
+import copy
+import sys
+from timeit import default_timer as timer
+
+import numpy as np
+import torch
+from torch import nn, optim
+
+from ..KN import count_params
+from .rnn import push_model, save_model
+
+
+def lorenz_phys_model(x: torch.Tensor, sigma: float = 10.0, rho: float = 28.0, beta: float = 8.0 / 3.0) -> torch.Tensor:
+    x1 = x[..., 0]
+    x2 = x[..., 1]
+    x3 = x[..., 2]
+    return torch.stack([
+        sigma * (x2 - x1),
+        x1 * (rho - x3) - x2,
+        x1 * x2 - beta * x3,
+    ], dim=-1)
+
+
+class ConvergenceMonitor:
+    def __init__(self, tol: float, max_epochs: int):
+        self.tol = tol
+        self.max_epochs = max_epochs
+        self.best = float('inf')
+        self.bad_epochs = 0
+
+    def record(self, value: float) -> None:
+        if value + self.tol < self.best:
+            self.best = value
+            self.bad_epochs = 0
+        else:
+            self.bad_epochs += 1
+
+    def monitor(self, epoch: int | None = None) -> bool:
+        _ = epoch
+        return self.bad_epochs >= self.max_epochs
+
+
 # ====== train_danse函数，必须顶格（与DANSE同级，不在DANSE类内部！） ======
 def train_pinnse(
     model, options, train_loader, val_loader, nepochs,

@@ -1,4 +1,21 @@
 
+from __future__ import annotations
+
+import math
+
+import torch
+from torch import nn
+
+from .rnn import RNN_model
+from .deltaK_incremental import DeltaKNet
+
+
+def create_diag(values: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(values):
+        values = torch.as_tensor(values, dtype=torch.float32)
+    return torch.diag_embed(values)
+
+
 # ==========================================================================
 # STEP 02: DANSE 滤波主框架 (DANSE Estimator Main Class)
 # ==========================================================================

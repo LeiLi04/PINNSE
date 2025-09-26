@@ -32,15 +32,106 @@ Adopted from: https://github.com/KalmanNet/KalmanNet_TSP
 # Feb 2023
 # Adopted from: https://github.com/KalmanNet/KalmanNet_TSP
 #####################################################
-from filterpy.kalman import UnscentedKalmanFilter, MerweScaledSigmaPoints, JulierSigmaPoints
+try:
+    from filterpy.kalman import UnscentedKalmanFilter, MerweScaledSigmaPoints, JulierSigmaPoints
+except Exception as _filterpy_exc:  # pragma: no cover - fallback for environments without filterpy deps
+    UnscentedKalmanFilter = None
+    MerweScaledSigmaPoints = None
+    JulierSigmaPoints = None
+    _FILTERPY_IMPORT_ERROR = _filterpy_exc
+else:  # pragma: no cover - import succeeded
+    _FILTERPY_IMPORT_ERROR = None
+
+try:
+    from scipy.linalg import expm
+except Exception:  # pragma: no cover - allow running without SciPy
+    expm = None
 import torch
 from torch import nn
 from timeit import default_timer as timer
-# from utils.utils import dB_to_lin, mse_loss
-from scipy.linalg import expm
-# from parameters import delta_t, J_test
 import numpy as np
 import math
+
+
+def dB_to_lin(x_dB: float) -> float:
+    """Convert decibels to linear scale."""
+
+    return 10.0 ** (x_dB / 10.0)
+
+
+def lin_to_dB(x_lin: float, eps: float = 1e-12) -> float:
+    """Convert linear value to dB with numerical floor."""
+
+    return 10.0 * np.log10(max(x_lin, eps))
+
+
+def mse_loss(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Mean squared error between two tensors."""
+
+    return torch.mean((a - b) ** 2)
+
+
+def lorenz_rhs(x: np.ndarray, sigma: float = 10.0, rho: float = 28.0, beta: float = 8.0 / 3.0) -> np.ndarray:
+    """Lorenz-63 continuous-time dynamics."""
+
+    x1, x2, x3 = x
+    return np.array([
+        sigma * (x2 - x1),
+        x1 * (rho - x3) - x2,
+        x1 * x2 - beta * x3,
+    ], dtype=float)
+
+
+def lorenz_rk4(x: np.ndarray, dt: float) -> np.ndarray:
+    """RK4 step for Lorenz dynamics."""
+
+    k1 = lorenz_rhs(x)
+    k2 = lorenz_rhs(x + 0.5 * dt * k1)
+    k3 = lorenz_rhs(x + 0.5 * dt * k2)
+    k4 = lorenz_rhs(x + dt * k3)
+    return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+
+def _merwe_sigma_points_np(x: np.ndarray, P: np.ndarray, alpha: float, beta: float, kappa: float,
+                           jitter: float = 1e-9) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return sigma points and weights for the given mean/covariance."""
+
+    n = x.shape[0]
+    lambda_ = alpha ** 2 * (n + kappa) - n
+    scaling = n + lambda_
+    if scaling <= 0:
+        raise ValueError("Sigma point scaling factor must be positive. Check alpha/kappa settings.")
+
+    P_safe = 0.5 * (P + P.T) + jitter * np.eye(n)
+    try:
+        sqrt_matrix = np.linalg.cholesky(scaling * P_safe)
+    except np.linalg.LinAlgError:
+        sqrt_matrix = np.linalg.cholesky(scaling * (P_safe + jitter * np.eye(n)))
+
+    sigma = np.zeros((2 * n + 1, n), dtype=float)
+    sigma[0] = x
+    for i in range(n):
+        col = sqrt_matrix[:, i]
+        sigma[i + 1] = x + col
+        sigma[n + i + 1] = x - col
+
+    Wm = np.full(2 * n + 1, 1.0 / (2.0 * scaling), dtype=float)
+    Wc = np.full(2 * n + 1, 1.0 / (2.0 * scaling), dtype=float)
+    Wm[0] = lambda_ / scaling
+    Wc[0] = lambda_ / scaling + (1.0 - alpha ** 2 + beta)
+
+    return sigma, Wm, Wc
+
+
+def _covariance_from_sigma(sigma: np.ndarray, mean: np.ndarray, Wc: np.ndarray,
+                           jitter: float = 1e-9) -> np.ndarray:
+    """Compute covariance from sigma points and weights."""
+
+    diff = sigma - mean
+    cov = diff.T @ (Wc[:, None] * diff)
+    cov = 0.5 * (cov + cov.T)
+    cov += jitter * np.eye(mean.size)
+    return cov
 
 
 def A_fn_exact(z, dt):
@@ -74,6 +165,9 @@ def A_fn_exact(z, dt):
     # --------------------------------------------------------------------------
     # Lorenz 系统的线性化矩阵 A 依赖于当前 x 分量 (z[0]); 这里使用经典参数。
     # ==========================================================================
+    if expm is None:
+        return lorenz_rk4(z, dt)
+
     return expm(np.array([
                     [-10, 10, 0],
                     [28, -1, -z[0]],
@@ -156,6 +250,12 @@ class UKF_Aliter(nn.Module):
                 nu_dB=None, device='cpu', init_cond=None):
         super(UKF_Aliter, self).__init__()
 
+        if UnscentedKalmanFilter is None or MerweScaledSigmaPoints is None:
+            raise RuntimeError(
+                "FilterPy 未成功导入，无法实例化 UKF_Aliter. 原因: "
+                f"{_FILTERPY_IMPORT_ERROR!r}"
+            )
+
         # ==========================================================================
         # STEP 01: 设备与系统维度初始化 (Device & dimensions)
         # ==========================================================================
@@ -177,6 +277,9 @@ class UKF_Aliter(nn.Module):
             q2 = dB_to_lin(nu_dB - inverse_r2_dB)
             Q = q2 * np.eye(self.n_states)
             R = r2 * np.eye(self.n_obs)
+
+        if Q is None or R is None:
+            raise ValueError("Q/R 未提供，且无法从 dB 参数推导。")
 
         # 将 numpy 转为驻留在 device 的 torch 张量
         self.Q_k = self.push_to_device(Q)  # 过程噪声协方差 Q
@@ -374,3 +477,163 @@ class UKF_Aliter(nn.Module):
         # STEP 03: 返回结果 (Return results)
         # ==========================================================================
         return traj_estimated, Pk_estimated, MSE_UKF_linear_arr.mean(), mse_ukf_dB_avg
+
+
+def _load_lorenz_dataset(dataset_path):
+    """Load pickled Lorenz trajectories with numpy._core compatibility."""
+
+    import pickle
+
+    class _CompatUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module.startswith("numpy._core"):
+                module = module.replace("numpy._core", "numpy.core")
+            return super().find_class(module, name)
+
+    with open(dataset_path, "rb") as handle:
+        return _CompatUnpickler(handle).load()
+
+
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="UKF demo on stored Lorenz dataset.")
+    parser.add_argument(
+        "--dataset",
+        #src/data/trajectories/trajectories_m_3_n_3_LorenzSSM_data_T_1000_N_500_r2_20.0dB_nu_-10.0dB.pkl
+        default="src/data/trajectories/trajectories_m_3_n_3_LorenzSSM_data_T_1000_N_500_r2_20.0dB_nu_-10.0dB.pkl",
+        help="Path to Lorenz trajectory pickle.",
+    )
+    parser.add_argument("--index", type=int, default=0, help="Sample index to visualise.")
+    args = parser.parse_args()
+
+    dataset_path = Path(args.dataset)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    payload = _load_lorenz_dataset(dataset_path)
+    num_samples = payload["num_samples"]
+    if not (0 <= args.index < num_samples):
+        raise IndexError(f"index {args.index} out of range (0 ≤ idx < {num_samples}).")
+
+    sample_X, sample_Y = payload["data"][args.index]
+    sample_X = np.asarray(sample_X, dtype=float)
+    sample_Y = np.asarray(sample_Y, dtype=float)
+
+    dt = 0.02
+    alpha, beta, kappa = 0.1, 2.0, -1.0
+    r2 = 1.0 / dB_to_lin(0.0)
+    q2 = dB_to_lin(-10.0 - 0.0)
+    Q = q2 * np.eye(sample_X.shape[1])
+    R = r2 * np.eye(sample_Y.shape[1])
+    jitter = 1e-6
+
+    x_post = sample_Y[0].astype(float)
+    P_post = np.eye(sample_X.shape[1]) * 5.0
+
+    estimates = np.zeros_like(sample_Y)
+    covariances = np.zeros((sample_Y.shape[0], sample_X.shape[1], sample_X.shape[1]))
+
+    for t in range(sample_Y.shape[0]):
+        sigma, Wm, Wc = _merwe_sigma_points_np(x_post, P_post, alpha, beta, kappa, jitter)
+        propagated = np.array([A_fn_exact(sp, dt) for sp in sigma])
+        x_pred = np.sum(Wm[:, None] * propagated, axis=0)
+        P_pred = _covariance_from_sigma(propagated, x_pred, Wc, jitter) + Q
+        sigma_pred, Wm_pred, Wc_pred = _merwe_sigma_points_np(x_pred, P_pred, alpha, beta, kappa, jitter)
+        Z_sigma = sigma_pred  # h(x)=x
+        z_pred = np.sum(Wm_pred[:, None] * Z_sigma, axis=0)
+        S = _covariance_from_sigma(Z_sigma, z_pred, Wc_pred, jitter) + R
+        Pxz = (sigma_pred - x_pred).T @ (Wc_pred[:, None] * (Z_sigma - z_pred))
+        K = Pxz @ np.linalg.inv(S)
+        innov = sample_Y[t] - z_pred
+        x_post = x_pred + K @ innov
+        P_post = P_pred - K @ S @ K.T
+        P_post = 0.5 * (P_post + P_post.T) + jitter * np.eye(P_post.shape[0])
+
+        estimates[t] = x_post
+        covariances[t] = P_post
+
+    x_hat_full = np.zeros_like(sample_X)
+    x_hat_full[0] = sample_X[0]
+    x_hat_full[1:] = estimates
+    x_hat_np = x_hat_full[1:]
+
+    mse_per_step = np.mean((x_hat_np - sample_X[1:, :]) ** 2, axis=1)
+    mse_lin = float(np.mean(mse_per_step))
+    mse_db = lin_to_dB(mse_lin)
+    time_axis = np.arange(sample_Y.shape[0])
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    import matplotlib.cbook as _mpl_cbook
+
+    if not hasattr(_mpl_cbook, "_is_pandas_dataframe"):
+        def _is_pandas_dataframe(_obj):
+            return False
+
+        _mpl_cbook._is_pandas_dataframe = _is_pandas_dataframe
+
+    if not hasattr(_mpl_cbook, "_Stack") and hasattr(_mpl_cbook, "Stack"):
+        _mpl_cbook._Stack = _mpl_cbook.Stack
+
+    if not hasattr(_mpl_cbook, "_ExceptionInfo"):
+        from collections import namedtuple
+
+        _mpl_cbook._ExceptionInfo = namedtuple("_ExceptionInfo", "exc_class exc traceback")
+
+    if not hasattr(_mpl_cbook, "_broadcast_with_masks"):
+        def _broadcast_with_masks(*arrays):
+            broadcasted = np.broadcast_arrays(*[np.asarray(arr) for arr in arrays])
+            return tuple(broadcasted)
+
+        _mpl_cbook._broadcast_with_masks = _broadcast_with_masks
+
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    fig = plt.figure(figsize=(18, 5))
+    ax_true = fig.add_subplot(1, 3, 1, projection="3d")
+    ax_obs = fig.add_subplot(1, 3, 2, projection="3d")
+    ax_est = fig.add_subplot(1, 3, 3, projection="3d")
+
+    ax_true.plot(sample_X[1:, 0], sample_X[1:, 1], sample_X[1:, 2], label="x (true)", color="tab:blue", linewidth=1.5)
+    ax_true.set_title("True state x")
+    ax_true.set_xlabel("x1")
+    ax_true.set_ylabel("x2")
+    ax_true.set_zlabel("x3")
+    ax_true.legend(fontsize="small")
+
+    ax_obs.plot(sample_Y[:, 0], sample_Y[:, 1], sample_Y[:, 2], label="y (obs)", color="tab:green", linewidth=1.2)
+    ax_obs.set_title("Observation y")
+    ax_obs.set_xlabel("y1")
+    ax_obs.set_ylabel("y2")
+    ax_obs.set_zlabel("y3")
+    ax_obs.legend(fontsize="small")
+
+    ax_est.plot(x_hat_np[:, 0], x_hat_np[:, 1], x_hat_np[:, 2], label="$\\hat{x}$ (estimate)", color="tab:orange", linewidth=1.5)
+    ax_est.set_title("Estimate $\\hat{x}$")
+    ax_est.set_xlabel("x1")
+    ax_est.set_ylabel("x2")
+    ax_est.set_zlabel("x3")
+    ax_est.legend(fontsize="small")
+
+    fig.tight_layout()
+    fig.savefig("lorenz_ukf_states.png", dpi=300)
+
+    fig_mse = plt.figure(figsize=(10, 3))
+    plt.plot(time_axis, mse_per_step, label="per-step MSE", color="tab:red")
+    plt.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="zero baseline")
+    plt.ylabel("MSE")
+    plt.xlabel("Time step")
+    plt.title("UKF per-step state estimation MSE")
+    plt.legend()
+    plt.grid(True, linewidth=0.3, alpha=0.7)
+    fig_mse.tight_layout()
+    fig_mse.savefig("lorenz_ukf_mse.png", dpi=300)
+
+    print(f"Summary stats -> MSE_lin: {mse_lin:.3f}, MSE_dB: {mse_db:.3f}")
+
+    plt.show()

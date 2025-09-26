@@ -23,7 +23,7 @@
 """
 
 # ==========================================================================
-# STEP 01: 导入依赖
+#                              导入依赖
 # ==========================================================================
 import numpy as np
 import scipy
@@ -46,10 +46,13 @@ from .state_space_model.LinearSSM import LinearSSM
 from .state_space_model.LorenzAttractorModel import LorenzAttractorModel
 from .state_space_model.SinusoidalSSM import SinusoidalSSM
 
+# ==========================================================================
+#           入参数获取函数 (相对导入，确保 src/ 根目录在 sys.path 中)
+# ==========================================================================
 try:
     from ..parameters import get_parameters
 except ImportError:
-    SRC_DIR = Path(__file__).resolve().parents[1]
+    SRC_DIR = Path(__file__).resolve().parents[1] # src/
     if str(SRC_DIR) not in sys.path:
         sys.path.append(str(SRC_DIR))
     from parameters import get_parameters
@@ -108,8 +111,9 @@ def initialize_model(type_, parameters):
             mu_w=parameters["mu_w"]
         )
     return model
-
-
+# ==========================================================================
+#                     Generate Single SSM Sequence
+# ==========================================================================
 def generate_SSM_data(model, T, parameters):
     """
     生成单条 SSM 序列 (X, Y)。
@@ -145,8 +149,9 @@ def generate_SSM_data(model, T, parameters):
         )
     return X_arr, Y_arr
 
-
-#+++++++++++++++++修改开始+++++++++++++++++++++
+# ==========================================================================
+#                Generate Multiple State-Observation Pairs
+# ==========================================================================
 def generate_state_observation_pairs(type_, parameters, T=200, N_samples=1000):
     """
     批量生成 N_samples 对 (X, Y) 状态/观测对。
@@ -203,6 +208,9 @@ def generate_state_observation_pairs(type_, parameters, T=200, N_samples=1000):
     return Z_XY
 
 
+# ==========================================================================
+#                     Create Filename
+# ==========================================================================
 def create_filename(T, N_samples, m, n, type_, inverse_r2_dB, nu_dB, dataset_basepath = "src/data/trajectories"):
     """
     基于核心超参数创建数据文件名 (便于溯源与区分)。
@@ -224,7 +232,9 @@ def create_filename(T, N_samples, m, n, type_, inverse_r2_dB, nu_dB, dataset_bas
     dataset_fullpath = os.path.join(dataset_basepath, datafile)
     return dataset_fullpath
 
-
+# ==========================================================================
+#                     Create and Save Dataset
+# ==========================================================================
 def create_and_save_dataset(T, N_samples, filename, parameters, type_="LorenzSSM"):
     """
     一键生成并保存 SSM 数据集到磁盘 (pickle)。
@@ -299,9 +309,9 @@ if __name__ == "__main__":
     inverse_r2_dB = args.inverse_r2_dB
     nu_dB = args.nu_dB
 
-    default_base = Path(__file__).resolve().parents[2] / "data"
+    default_base = Path(__file__).resolve().parents[2] / "data/trajectories"    # PINNSE/src/../data/trajectories
     base_path = Path(args.output_path) if args.output_path else default_base
-    base_path.mkdir(parents=True, exist_ok=True)
+    base_path.mkdir(parents=True, exist_ok=True) # ensure dir exists， exist_ok=True避免已存在时报错
 
     datafilename = create_filename(
         T=T,

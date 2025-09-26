@@ -43,9 +43,6 @@ def count_params(model: nn.Module):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
-# +++++++++++Colab_Start+++++++
-# from utils.utils import count_params
-# +++++++++++Colab_End+++++++
 
 
 class KalmanNetNN(nn.Module):
@@ -158,14 +155,24 @@ class KalmanNetNN(nn.Module):
         # self.f_k = f
         # self.h_k = h
         # 统一把 f/h 的输出转成 torch.Tensor（float32 + 正确 device）
+        def _ensure_tensor(x):
+            if isinstance(x, torch.Tensor):
+                return x.to(torch.device("cpu"), dtype=torch.float32)
+            return torch.as_tensor(x, dtype=torch.float32)
+
+        def _ensure_numpy(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach().cpu().numpy()
+            return x
+
         def _to_tensor(z):
             if isinstance(z, torch.Tensor):
                 return z.to(self.device, dtype=torch.float32)
             return torch.as_tensor(z, dtype=torch.float32, device=self.device)
 
         # 保存包装后的函数
-        self.f_k = lambda x: _to_tensor(f(x))
-        self.h_k = lambda x: _to_tensor(h(x))
+        self.f_k = lambda x: _to_tensor(f(_ensure_tensor(x)))
+        self.h_k = lambda x: _to_tensor(h(_ensure_numpy(x)))
 
         # ==================================================================
         # STEP 02: 初始化 Kalman Gain 网络层 (Build Kalman Gain network)
@@ -174,10 +181,15 @@ class KalmanNetNN(nn.Module):
         # Initializing the Kalman Gain network
         # This network is: FC + RNN (e.g. GRU) + FC
         ##############################################
-        # Input features are:
-            # 1. Innovation at time t: \delta y_t = y_t - \hat{y}_{t \vert t-1} (self.n_obs, 1)
-            # 2. Forward update difference: \delta x_{t-1} = \hat{x}_{t-1 \vert t-1} - \hat{x}_{t-1 \vert t-2} (self.n_states, 1)
-        # Output of the net is the Kalman Gain computed at time t: K_t (self.n_states, self.n_obs)
+        # Input features:
+        # 1. Innovation at time t:
+        #    δy_t = y_t - ŷ_{t|t-1}, shape: (self.n_obs, 1)
+        # 2. Forward update difference:
+        #    δx_{t-1} = ŷ_{t-1|t-1} - ŷ_{t-1|t-2}, shape: (self.n_states, 1)
+        #
+        # Output:
+        # Kalman Gain at time t:
+        # K_t, shape: (self.n_states, self.n_obs)
 
         #############################
         ### Input Layer of KNet ###
@@ -236,10 +248,10 @@ class KalmanNetNN(nn.Module):
         # ------------------------------------------------------------------
 
         # Adjust for batch size
-        M1_0 = torch.cat(self.batch_size*[M1_0],axis = 1).reshape(self.n_states, self.batch_size)
-        self.m1x_prior = M1_0.detach().to(self.device, non_blocking = True) # Initial value of \mathbf{x}_{t \vert t-1}
-        self.m1x_posterior = M1_0.detach().to(self.device, non_blocking = True) # Initial value of \mathbf{x}_{t-1 \vert t-1}
-        self.state_process_posterior_0 = M1_0.detach().to(self.device, non_blocking = True)
+        M1_0 = M1_0.repeat(1, self.batch_size)   # (n_states, batch_size)
+        self.m1x_prior = M1_0.detach().to(self.device, non_blocking = True) # Initial value of x_{t|t-1}
+        self.m1x_posterior = M1_0.detach().to(self.device, non_blocking = True) # Initial value of x_{t-1|t-1}
+        self.state_process_posterior_0 = M1_0.detach().to(self.device, non_blocking = True) # Initial value of x_{t-1|t-1} for state process
 
     #########################################################
     ### Set Batch Size and initialize hidden state of GRU ###
@@ -276,10 +288,10 @@ class KalmanNetNN(nn.Module):
             None: 更新 `state_process_prior_0`, `obs_process_0`, `m1x_prior`, `m1y`。
 
         Tensor Dimensions:
-            - state_process_prior_0: [n_states, batch_size]
-            - obs_process_0: [n_obs, batch_size]
-            - m1x_prior: [n_states, batch_size]
-            - m1y: [n_obs, batch_size]
+            - state_process_prior_0: [n_states, batch_size]， 表示 真实状态过程的先验 (state prior trajectory)。
+            - obs_process_0: [n_obs, batch_size]， 真实观测过程的预测 (observation prior trajectory)。
+            - m1x_prior: [n_states, batch_size]，   表示 状态的均值先验 (mean prior of state)。
+            - m1y: [n_obs, batch_size]，          表示 观测分布的一阶矩 （均值）
 
         Math Notes:
             x_prior = f(x_post_prev)
@@ -289,36 +301,35 @@ class KalmanNetNN(nn.Module):
         # ==================================================================
         # STEP 01: 生成状态先验 (State prior propagation)
         # ------------------------------------------------------------------
+        # Formula: x_{t|t-1} = f(x_{t-1|t-1})
+        batch_size = self.state_process_posterior_0.shape[1]
+        state_prior_list = []
+        obs_prior_list = []
+        for i in range(batch_size):
+            prior_state_vec = self.f_k(self.state_process_posterior_0[:, i].reshape(-1, 1)).view(-1)
+            state_prior_list.append(prior_state_vec)
+            obs_prior_vec = self.h_k(prior_state_vec.reshape(-1, 1)).view(-1)
+            obs_prior_list.append(obs_prior_vec)
 
-        # Compute the 1-st moment of x based on model knowledge and without process noise
-        self.state_process_prior_0 = torch.zeros_like(self.state_process_posterior_0).type(torch.FloatTensor).to(self.device)
-        for i in range(self.state_process_posterior_0.shape[1]):
-            #print(i, self.state_process_prior_0.shape, self.state_process_posterior_0.shape)
-            self.state_process_prior_0[:, i] = self.f_k(self.state_process_posterior_0[:,i].reshape((-1,1))).view(-1,)
-        #self.state_process_prior_0 = self.f_k(self.state_process_posterior_0) # torch.matmul(self.F,self.state_process_posterior_0)
-
-        # ==================================================================
-        # STEP 02: 预测观测 (Observation prediction)
-        # ------------------------------------------------------------------
-        # Compute the 1-st moment of y based on model knowledge and without noise
-        self.obs_process_0 = torch.zeros_like(self.state_process_prior_0).type(torch.FloatTensor).to(self.device)
-        for i in range(self.state_process_posterior_0.shape[1]):
-            self.obs_process_0[:, i] = self.h_k(self.state_process_prior_0[:,i].reshape((-1,1))).view(-1,)
-        #self.obs_process_0 = self.h_k(self.state_process_posterior_0) # torch.matmul(self.H, self.state_process_prior_0)
+        self.state_process_prior_0 = torch.stack(state_prior_list, dim=1)
+        self.obs_process_0 = torch.stack(obs_prior_list, dim=1)
 
         # ==================================================================
         # STEP 03: 更新状态与观测的均值 (Update means for recursion)
         # ------------------------------------------------------------------
         # Predict the 1-st moment of x
+        # Formula: m1x_prior = f(m1x_posterior)
         self.m1x_prev_prior = self.m1x_prior
-        self.m1x_prior = torch.zeros_like(self.m1x_posterior).type(torch.FloatTensor).to(self.device)
+        m1x_prior_list = []
+        m1y_list = []
         for i in range(self.m1x_posterior.shape[1]):
-            self.m1x_prior[:,i] = self.f_k(self.m1x_posterior[:,i].reshape((-1,1))).view(-1,) # torch.matmul(self.F, self.m1x_posterior)
+            m1x_prior_vec = self.f_k(self.m1x_posterior[:, i].reshape(-1, 1)).view(-1)
+            m1x_prior_list.append(m1x_prior_vec)
+            m1y_vec = self.h_k(m1x_prior_vec.reshape(-1, 1)).view(-1)
+            m1y_list.append(m1y_vec)
 
-        # Predict the 1-st moment of y
-        self.m1y = torch.zeros_like(self.m1x_prior).type(torch.FloatTensor).to(self.device)
-        for i in range(self.m1y.shape[1]):
-            self.m1y[:,i] = self.h_k(self.m1x_prior[:,i].reshape((-1,1))).view(-1,) # torch.matmul(self.H, self.m1x_prior)
+        self.m1x_prior = torch.stack(m1x_prior_list, dim=1)
+        self.m1y = torch.stack(m1y_list, dim=1)
 
     #######################
     ### Kalman Net Step ###
@@ -349,7 +360,7 @@ class KalmanNetNN(nn.Module):
         self.step_prior() # Compute Priors
 
         # ==================================================================
-        # STEP 02: 估计 Kalman 增益 (Estimate Kalman gain)
+        # *STEP 02: 估计 Kalman 增益 (Estimate Kalman gain)
         # ------------------------------------------------------------------
         self.step_KGain_est(y)  # Compute Kalman Gain
 
@@ -411,7 +422,9 @@ class KalmanNetNN(nn.Module):
 
         # Reshape and Normalize the difference in X prior
         # dm1x = self.m1x_prior - self.state_process_prior_0
-        # (this is equivalent to Forward update difference: \delta x_{t-1} = \hat{x}_{t-1 \vert t-1} - \hat{x}_{t-1 \vert t-2} (self.n_states, 1))
+        # (this is equivalent to Forward update difference: 
+        # Forward update difference: 
+        # δx_{t-1} = x̂_{t-1|t-1} - x̂_{t-1|t-2}, shape = (n_states, 1)
         dm1x = self.m1x_posterior - self.m1x_prev_prior
         dm1x_reshape = torch.squeeze(dm1x)
         dm1x_norm = func.normalize(dm1x_reshape, p=2, dim=0, eps=1e-12, out=None)
@@ -422,7 +435,7 @@ class KalmanNetNN(nn.Module):
         # Normalize y
         # (this is equivalent to Innovation at time t: \delta y_t = y_t - \hat{y}_{t \vert t-1} (self.n_obs, 1))
         dm1y = y - torch.squeeze(self.m1y) #y.squeeze() - torch.squeeze(self.m1y)
-        dm1y_norm = func.normalize(dm1y, p=2, dim=0, eps=1e-12, out=None)
+        dm1y_norm = func.normalize(dm1y, p=2, dim=0, eps=1e-12, out=None)   # dm1x_norm = dm1x / ( ||dm1x||_2 + eps )
 
         # ==================================================================
         # STEP 03: 拼接输入并运行网络 (Run gain network)
@@ -548,7 +561,8 @@ class KalmanNetNN(nn.Module):
         # STEP 01: 基于当前参数形状生成零张量 (Zero initialization)
         # ------------------------------------------------------------------
         weight = next(self.parameters()).data
-        hidden = weight.new(self.n_layers, self.batch_size, self.hidden_dim).zero_()
+        hidden = torch.zeros(self.n_layers, self.batch_size, self.hidden_dim,
+                     device=weight.device, dtype=weight.dtype)
         self.hn = hidden.data
 
     def compute_predictions(self, y_test_batch):
@@ -720,7 +734,7 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
           for t in range(0, Ty):
               #print("Time instant t:{}".format(t+1))
               x_out_cv[:,:, t] = model(y_cv[:,:, t]).T
-              y_out_cv[:,:,t] = model.m1y.squeeze().T
+              y_out_cv[:,:,t] = model.m1y.squeeze().T   #观测的预测均值（滤波器内部 m1y）
 
         # Compute Training Loss
         cv_loss = loss_fn(x_out_cv[:,:,:Ty], cv_target[:,:,1:]).item()
@@ -766,12 +780,22 @@ def train_KalmanNetNN(model, options, train_loader, val_loader, nepochs,
         model.SetBatch(N_E)
         model.InitSequence(torch.zeros(model.n_states,1))
 
-        x_out_training = torch.empty(N_E, model.n_states, Ty, device=device).to(model.device)
-        y_out_training = torch.empty(N_E, model.n_obs, Ty,device=device).to(model.device)
+        x_out_list = []
+        y_out_list = []
 
         for t in range(0, Ty):
-            x_out_training[:,:,t] = model(y_training[:,:,t]).T
-            y_out_training[:,:,t] = model.m1y.squeeze().T
+            state_pred = model(y_training[:, :, t]).T  # [N_E, n_states]
+
+            obs_pred = model.m1y
+            if obs_pred.dim() == 3:
+                obs_pred = obs_pred.squeeze(-1)
+            obs_pred = obs_pred.transpose(0, 1).contiguous()  # [N_E, n_obs]
+
+            x_out_list.append(state_pred.unsqueeze(-1))
+            y_out_list.append(obs_pred.unsqueeze(-1))
+
+        x_out_training = torch.cat(x_out_list, dim=-1)  # [N_E, n_states, Ty]
+        y_out_training = torch.cat(y_out_list, dim=-1)  # [N_E, n_obs, Ty]
 
 
         # 计算用于反传的张量损失
@@ -925,7 +949,7 @@ def test_KalmanNetNN(model_test, test_loader, options, device, model_file=None, 
         model_test.InitSequence(model_test.ssModel.m1x_0)
 
         if not test_logfile_path is None:
-            test_log = "./log/test_danse.log"
+            test_log = "./log/test_knet.log"
         else:
             test_log = test_logfile_path
 

@@ -1,4 +1,38 @@
 # ====== train_danse函数，必须顶格（与DANSE同级，不在DANSE类内部！） ======
+from __future__ import annotations
+
+import copy
+import sys
+from timeit import default_timer as timer
+
+import numpy as np
+import torch
+from torch import nn, optim
+
+from ..KN import count_params
+from .rnn import push_model, save_model
+
+
+class ConvergenceMonitor:
+    """Simple early-stopping style convergence tracker."""
+
+    def __init__(self, tol: float, max_epochs: int):
+        self.tol = tol
+        self.max_epochs = max_epochs
+        self.best = float("inf")
+        self.bad_epochs = 0
+
+    def record(self, value: float) -> None:
+        if value + self.tol < self.best:
+            self.best = value
+            self.bad_epochs = 0
+        else:
+            self.bad_epochs += 1
+
+    def monitor(self, epoch: int | None = None) -> bool:
+        _ = epoch  # unused but kept for API compatibility
+        return self.bad_epochs >= self.max_epochs
+
 def train_danse(
     model, options, train_loader, val_loader, nepochs,
     logfile_path, modelfile_path, save_chkpoints,

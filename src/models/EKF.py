@@ -12,6 +12,7 @@ Author: You (with ChatGPT assist, 2025)
 """
 
 import math
+import pickle
 import numpy as np
 import torch
 from torch import nn
@@ -317,3 +318,267 @@ class EKF_Lorenz(nn.Module):
                 "MSE_dB": 10*np.log10(max(mse_lin, 1e-20))
             })
         return out
+
+
+def _load_lorenz_dataset(dataset_path):
+    """Load trajectory pickle generated on another host (handles numpy._core rename)."""
+    class _CompatUnpickler(pickle.Unpickler):  # local helper to keep scope tight
+        def find_class(self, module, name):
+            if module.startswith("numpy._core"):
+                module = module.replace("numpy._core", "numpy.core")
+            return super().find_class(module, name)
+
+    with open(dataset_path, "rb") as handle:
+        return _CompatUnpickler(handle).load()
+
+
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="EKF_Lorenz quick-look demo on a stored dataset.")
+    parser.add_argument(
+        "--dataset",
+        default="src/data/trajectories/trajectories_m_3_n_3_LorenzSSM_data_T_1000_N_500_r2_20.0dB_nu_-10.0dB.pkl",
+        help="Path to the trajectory pickle (default: provided Lorenz dataset).",
+    )
+    parser.add_argument("--index", type=int, default=0, help="Sample index to visualise (default: 0).")
+    parser.add_argument("--order", type=int, default=1, choices=(1, 2), help="Prediction Taylor order.")
+    args = parser.parse_args()
+
+    dataset_path = Path(args.dataset)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    payload = _load_lorenz_dataset(dataset_path)
+    num_samples = payload["num_samples"]
+    if not (0 <= args.index < num_samples):
+        raise IndexError(f"index {args.index} out of range (0 ≤ idx < {num_samples}).")
+
+    sample_X, sample_Y = payload["data"][args.index]
+    sample_X = np.asarray(sample_X, dtype=float)
+    sample_Y = np.asarray(sample_Y, dtype=float)
+
+    ekf = EKF_Lorenz(
+        n_states=sample_X.shape[1],
+        n_obs=sample_Y.shape[1],
+        delta_t=0.02,
+        inverse_r2_dB=0.0,
+        nu_dB=-10.0,
+        order=args.order,
+        device="cpu",
+    )
+
+    ekf.initialize(x0=sample_Y[0], P0=np.eye(sample_X.shape[1]) * 5.0)
+
+    torch_Y = torch.from_numpy(sample_Y).float()
+    torch_X = torch.from_numpy(sample_X[1:]).float()
+    X_hat, _, stats = ekf.filter_sequence(torch_Y, torch_X)
+
+    x_hat_np = X_hat.cpu().numpy()
+    mse_per_step = np.mean((x_hat_np - sample_X[1:]) ** 2, axis=1)
+
+    time_axis = np.arange(sample_Y.shape[0])
+    '''
+    #     Project / Algorithm 背景:
+    #     非线性系统(Lorenz)下的状态估计可视化：展示真值轨迹、观测数据与滤波估计，并绘制逐步均方误差曲线。
+
+    # Inputs / 输入:
+    #     sample_X : ndarray, shape [T, 3]
+    #         True state trajectory x(t). 列为 (x1, x2, x3)。
+    #     sample_Y : ndarray, shape [T, 3]
+    #         Observation sequence y(t)。与状态维度一致的观测向量。
+    #     x_hat_np : ndarray, shape [T, 3]
+    #         Estimated state trajectory x_hat(t)，来自 EKF/UKF/Transformer-Filter 等估计器。
+    #     time_axis : ndarray, shape [T]
+    #         离散时间索引，用于横轴绘制 MSE 曲线。
+    #     mse_per_step : ndarray, shape [T]
+    #         每个时间步的状态估计均方误差，定义如 mean((x_hat - x_true)^2) over state dims。
+    #     stats : dict
+    #         汇总统计量，例如:
+    #           - 'NIS_mean' : 平均 NIS 指标（若使用一致性检验）
+    #           - 'mse_lin'  : 线性尺度的整体 MSE (例如全时序平均)
+    #           - 'mse_dB'   : 以 10*log10(mse_lin) 表示的 dB 尺度误差
+
+    # Outputs / 输出:
+    #     - "lorenz_ekf_states.png": 3D 轨迹图 (真值 / 观测 / 估计)。
+    #     - "lorenz_ekf_mse.png"   : 逐步 MSE 曲线图。
+    #     - 控制台打印统计摘要 (NIS_mean, MSE_lin, MSE_dB)。
+
+    # Tensor Dimensions / 张量维度对照:
+    #     T : 时间步长度，state_dim = 3
+    #     sample_X[t]     ∈ R^3
+    #     sample_Y[t]     ∈ R^3
+    #     x_hat_np[t]     ∈ R^3
+    #     mse_per_step[t] ∈ R
+    #     time_axis[t]    ∈ R
+
+    # Math Notes / 数学说明 (纯文本公式):
+    #     per-step MSE:
+    #         mse[t] = mean( (x_hat_np[t, :] - sample_X[t, :])^2 )
+    #     Summary metrics (示例):
+    #         mse_lin = mean_t mse[t]
+    #         mse_dB  = 10 * log10( mse_lin )
+    #     以上仅示意，具体计算应与上游统计模块保持一致。
+
+    # Target Audience / 目标读者:
+    #     熟悉数值计算与信号处理的研究者与工程师，希望复现实验图与评估指标。
+    '''
+    
+# ==========================================================================
+# STEP 01: 配置 Matplotlib 后端与兼容性补丁
+# ==========================================================================
+# 说明:
+# - 使用 "Agg" 后端以便在无显示环境(如服务器/CI/Colab 后台)生成并保存静态图像。
+# - 一些老版本/特定发行版的 matplotlib.cbook 中缺失内部符号。
+#   通过 hasattr 检查并注入最小替代实现，确保后续代码在多环境下可运行。
+# 注意:
+# - 这些补丁是工程性兼容措施，不改变绘图语义，仅避免 AttributeError。
+import matplotlib
+matplotlib.use("Agg")
+
+import matplotlib.cbook as _mpl_cbook
+
+if not hasattr(_mpl_cbook, "_is_pandas_dataframe"):
+    # ----------------------------------------------------------------------
+    # 补丁 1: 标记对象是否为 pandas.DataFrame
+    # 在某些版本中该内部工具函数不存在，定义一个保守返回 False 的替代。
+    def _is_pandas_dataframe(_obj):
+        return False
+
+    _mpl_cbook._is_pandas_dataframe = _is_pandas_dataframe
+
+if not hasattr(_mpl_cbook, "_Stack") and hasattr(_mpl_cbook, "Stack"):
+    # ----------------------------------------------------------------------
+    # 补丁 2: 将公开的 Stack 映射为内部名 _Stack，满足旧代码引用。
+    _mpl_cbook._Stack = _mpl_cbook.Stack
+
+if not hasattr(_mpl_cbook, "_ExceptionInfo"):
+    # ----------------------------------------------------------------------
+    # 补丁 3: 定义 _ExceptionInfo 命名元组，便于统一异常信息封装。
+    from collections import namedtuple
+
+    _mpl_cbook._ExceptionInfo = namedtuple("_ExceptionInfo", "exc_class exc traceback")
+
+if not hasattr(_mpl_cbook, "_broadcast_with_masks"):
+    # ----------------------------------------------------------------------
+    # 补丁 4: 定义 _broadcast_with_masks，最小实现仅进行 numpy 广播。
+    # 用途: 对输入数组进行形状广播，返回广播后的元组。
+    import numpy as np
+    def _broadcast_with_masks(*arrays):
+        broadcasted = np.broadcast_arrays(*[np.asarray(arr) for arr in arrays])
+        return tuple(broadcasted)
+
+    _mpl_cbook._broadcast_with_masks = _broadcast_with_masks
+
+# ==========================================================================
+# STEP 02: 导入绘图 API 与 3D 工具
+# ==========================================================================
+# - pyplot: 面向状态机的绘图接口，便捷生成 Figure/Axes。
+# - mpl_toolkits.mplot3d: 以 3D 投影绘制 Lorenz 轨迹（x1, x2, x3）。
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (projection side-effects)
+
+# ==========================================================================
+# STEP 03: 创建画布与三个 3D 子图 (真值 / 观测 / 估计)
+# ==========================================================================
+# 布局:
+#   [1, 3] 的子图栅格:
+#     - ax_true:  真值 x(t)
+#     - ax_obs:   观测 y(t)
+#     - ax_est:   估计 x_hat(t)
+# 说明:
+#   - figsize 采用横向宽屏，便于并排比较三条轨迹的几何差异。
+fig = plt.figure(figsize=(18, 5))
+ax_true = fig.add_subplot(1, 3, 1, projection="3d")
+ax_obs = fig.add_subplot(1, 3, 2, projection="3d")
+ax_est = fig.add_subplot(1, 3, 3, projection="3d")
+
+# ==========================================================================
+# STEP 04: 绘制真值轨迹 x(t)
+# ==========================================================================
+# 数据约定:
+#   sample_X[1:, i] 对应第 i 个状态分量的时间序列，i ∈ {0,1,2}
+# 细节:
+#   - 从 1 开始索引，避开可能的初始过渡点 (若首点不可视化)。
+#   - label 用于图例区分。
+ax_true.plot(sample_X[1:, 0], sample_X[1:, 1], sample_X[1:, 2], label="x (true)", color="tab:blue", linewidth=1.5)
+ax_true.set_title("True state x")
+ax_true.set_xlabel("x1")
+ax_true.set_ylabel("x2")
+ax_true.set_zlabel("x3")
+ax_true.legend(fontsize="small")
+
+# ==========================================================================
+# STEP 05: 绘制观测轨迹 y(t)
+# ==========================================================================
+# 说明:
+#   - 观测 y 可能受测量噪声/观测模型影响，与真值存在偏差。
+#   - 通过 3D 轨迹形态对比可直观看到噪声与观测函数的影响。
+ax_obs.plot(sample_Y[:, 0], sample_Y[:, 1], sample_Y[:, 2], label="y (obs)", color="tab:green", linewidth=1.2)
+ax_obs.set_title("Observation y")
+ax_obs.set_xlabel("y1")
+ax_obs.set_ylabel("y2")
+ax_obs.set_zlabel("y3")
+ax_obs.legend(fontsize="small")
+
+# ==========================================================================
+# STEP 06: 绘制估计轨迹 x_hat(t)
+# ==========================================================================
+# 说明:
+#   - 估计轨迹应尽可能贴近真值轨迹；偏差与延迟反映滤波器性能。
+#   - 若采用 EKF/UKF/Particle/NN-Filter，差异来源包括线性化误差、噪声建模、网络表达等。
+ax_est.plot(x_hat_np[:, 0], x_hat_np[:, 1], x_hat_np[:, 2], label="$\\hat{x}$ (estimate)", color="tab:orange", linewidth=1.5)
+ax_est.set_title("Estimate $\\hat{x}$")
+ax_est.set_xlabel("x1")
+ax_est.set_ylabel("x2")
+ax_est.set_zlabel("x3")
+ax_est.legend(fontsize="small")
+
+# 优化整体布局，避免子图元素重叠；保存状态轨迹图。
+fig.tight_layout()
+fig.savefig("lorenz_ekf_states.png", dpi=300)
+
+# ==========================================================================
+# STEP 07: 绘制逐步 MSE 曲线
+# ==========================================================================
+# 含义:
+#   - mse_per_step[t] 度量 t 时刻的估计误差强度。曲线越低越好。
+#   - 以 time_axis 为横轴，有助于定位误差峰值与稳态收敛段。
+# 设计:
+#   - 使用细虚线 baseline=0 便于参照。
+fig_mse = plt.figure(figsize=(10, 3))
+plt.plot(time_axis, mse_per_step, label="per-step MSE", color="tab:red")
+plt.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="zero baseline")
+plt.ylabel("MSE")
+plt.xlabel("Time step")
+plt.title("Per-step state estimation MSE")
+plt.legend()
+plt.grid(True, linewidth=0.3, alpha=0.7)
+fig_mse.tight_layout()
+fig_mse.savefig("lorenz_ekf_mse.png", dpi=600)
+
+# ==========================================================================
+# STEP 08: 打印汇总统计
+# ==========================================================================
+# 说明:
+#   - NIS_mean: 若实现了 NIS 一致性检验，其均值应接近状态维度 (在理想假设下)。
+#   - mse_lin / mse_dB: 便于在日志中快速比较不同模型或超参配置。
+print(
+    f"Summary stats -> NIS_mean: {stats['NIS_mean']:.3f}, "
+    f"MSE_lin: {stats['mse_lin']:.3f}, MSE_dB: {stats['mse_dB']:.3f}"
+)
+
+# ==========================================================================
+# STEP 09: 刷新绘图
+# ==========================================================================
+# 说明:
+#   - 即便使用 "Agg" 后端，调用 plt.show() 在交互环境下也可触发渲染，
+#     在无显示环境中不会弹窗，但不影响图像保存至文件。
+plt.show()
+
+
+
+
+
+
