@@ -1,0 +1,71 @@
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+
+# 创建画布
+fig, ax = plt.subplots(figsize=(10,6))
+
+# 绘制方框：PriorNet
+prior_box = mpatches.FancyBboxPatch((0.1,0.6), 0.2,0.15,
+                                    boxstyle="round,pad=0.05",
+                                    linewidth=1.5, edgecolor="blue", facecolor="lightblue")
+ax.add_patch(prior_box)
+ax.text(0.2,0.675,"PriorNet\n(RNN/GRU/LSTM)", ha="center", va="center", fontsize=10)
+
+# 绘制方框：观测模型
+obs_box = mpatches.FancyBboxPatch((0.1,0.3), 0.2,0.15,
+                                  boxstyle="round,pad=0.05",
+                                  linewidth=1.5, edgecolor="green", facecolor="lightgreen")
+ax.add_patch(obs_box)
+ax.text(0.2,0.375,"观测模型\n(h/H)", ha="center", va="center", fontsize=10)
+
+# 绘制方框：协方差网络1
+cov1_box = mpatches.FancyBboxPatch((0.5,0.7), 0.2,0.12,
+                                   boxstyle="round,pad=0.05",
+                                   linewidth=1.5, edgecolor="orange", facecolor="moccasin")
+ax.add_patch(cov1_box)
+ax.text(0.6,0.76,"协方差网络1\n(P)", ha="center", va="center", fontsize=10)
+
+# 绘制方框：协方差网络2
+cov2_box = mpatches.FancyBboxPatch((0.5,0.5), 0.2,0.12,
+                                   boxstyle="round,pad=0.05",
+                                   linewidth=1.5, edgecolor="orange", facecolor="moccasin")
+ax.add_patch(cov2_box)
+ax.text(0.6,0.56,"协方差网络2\n(S^-1)", ha="center", va="center", fontsize=10)
+
+# 绘制方框：卡尔曼更新
+kf_box = mpatches.FancyBboxPatch((0.8,0.55), 0.15,0.2,
+                                 boxstyle="round,pad=0.05",
+                                 linewidth=1.5, edgecolor="purple", facecolor="lavender")
+ax.add_patch(kf_box)
+ax.text(0.875,0.65,"KF更新\n(K·残差)", ha="center", va="center", fontsize=10)
+
+# 绘制箭头
+ax.annotate("", xy=(0.3,0.68), xytext=(0.5,0.76),
+            arrowprops=dict(arrowstyle="->", lw=1.5))
+ax.annotate("", xy=(0.3,0.375), xytext=(0.5,0.56),
+            arrowprops=dict(arrowstyle="->", lw=1.5))
+ax.annotate("", xy=(0.7,0.76), xytext=(0.8,0.65),
+            arrowprops=dict(arrowstyle="->", lw=1.5))
+ax.annotate("", xy=(0.7,0.56), xytext=(0.8,0.65),
+            arrowprops=dict(arrowstyle="->", lw=1.5))
+
+# 来自PriorNet的先验输入到KF更新
+ax.annotate("", xy=(0.3,0.68), xytext=(0.8,0.65),
+            arrowprops=dict(arrowstyle="->", lw=1.5, linestyle="dashed", color="blue"))
+
+# 来自观测模型的预测观测输入到KF更新
+ax.annotate("", xy=(0.3,0.375), xytext=(0.8,0.65),
+            arrowprops=dict(arrowstyle="->", lw=1.5, linestyle="dashed", color="green"))
+
+# 文本说明
+ax.text(0.5,0.2,"图1：无监督神经卡尔曼滤波架构示意图\n蓝色 PriorNet 产生先验；绿色观测模型提供预测观测与 H；\n橙色网络分别学习 P 与 S^-1；\nKF 更新模块结合它们计算 K 并完成更新。",
+        ha="center", va="center", fontsize=10, bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
+
+# 设置范围和隐藏坐标轴
+ax.set_xlim(0,1.1)
+ax.set_ylim(0,1)
+ax.axis("off")
+
+plt.savefig("architecture.png", dpi=300, bbox_inches="tight")
+plt.show()

@@ -141,8 +141,8 @@ def main():
     x_hat[0] = sample_X[0]
     x_hat[1:] = estimates
 
-    mse_per_step = np.mean((x_hat[1:] - sample_X[1:]) ** 2, axis=1)
-    mse_lin = float(np.mean(mse_per_step))
+    mse_per_step = np.mean((x_hat[1:] - sample_X[1:]) ** 2, axis=1) # axis=1 -> (T, )
+    mse_lin = float(np.mean(mse_per_step)) # (T, ) 
     mse_dB = lin_to_dB(mse_lin)
 
     time_axis = np.arange(sample_Y.shape[0])
@@ -150,7 +150,7 @@ def main():
     _setup_matplotlib()
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-
+    # 3D Trajectory plots 
     fig = plt.figure(figsize=(18, 5))
     ax_true = fig.add_subplot(1, 3, 1, projection="3d")
     ax_obs = fig.add_subplot(1, 3, 2, projection="3d")
@@ -178,8 +178,9 @@ def main():
     ax_est.legend(fontsize="small")
 
     fig.tight_layout()
-    fig.savefig("lorenz_ukf_fp_states.png", dpi=300)
+    fig.savefig("trajectory_3d_x_y_x_est_lorenz_ukf_fp_states.png", dpi=300)
 
+    # Per-step MSE plot
     fig_mse = plt.figure(figsize=(10, 3))
     plt.plot(time_axis, mse_per_step, label="per-step MSE", color="tab:red")
     plt.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="zero baseline")
@@ -189,7 +190,7 @@ def main():
     plt.legend()
     plt.grid(True, linewidth=0.3, alpha=0.7)
     fig_mse.tight_layout()
-    fig_mse.savefig("lorenz_ukf_fp_mse.png", dpi=300)
+    fig_mse.savefig("mse_T_lorenz_ukf_fp.png", dpi=300)
 
     print(f"Summary stats -> MSE_lin: {mse_lin:.3f}, MSE_dB: {mse_dB:.3f}")
 
